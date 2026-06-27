@@ -125,15 +125,20 @@ void addLocalLoadNoAliasScope(Operation *localLoadOp,
 }
 
 void addLocalLoadNoAliasScope(LLVM::AliasAnalysisOpInterface llLoadOp) {
+  addLocalLoadNoAliasScopeAttrs(llLoadOp);
+}
+
+void addLocalLoadNoAliasScopeAttrs(Operation *llLoadOp) {
   auto ctx = llLoadOp->getContext();
 
   // Do not alias with AsyncCopies
   auto noAliasScopes = ArrayAttr::get(ctx, getAsyncCopyScope(ctx));
-  llLoadOp.setNoAliasScopes(noAliasScopes);
+  llLoadOp->setAttr(LLVM::LLVMDialect::getNoAliasScopesAttrName(),
+                    noAliasScopes);
 
   // Add to different scope as ops without any scope alias with everything
   auto aliasScopes = ArrayAttr::get(ctx, getLoadCopyScope(ctx));
-  llLoadOp.setAliasScopes(aliasScopes);
+  llLoadOp->setAttr(LLVM::LLVMDialect::getAliasScopesAttrName(), aliasScopes);
 }
 
 unsigned

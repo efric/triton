@@ -37,6 +37,9 @@ void addLocalLoadNoAliasScope(Operation *localLoadOp,
                               LLVM::AliasAnalysisOpInterface llLoadOp);
 // Overload from above without checking the AsyncToken
 void addLocalLoadNoAliasScope(LLVM::AliasAnalysisOpInterface llLoadOp);
+// Same annotation for LLVM ops that support alias/noalias attributes but do not
+// implement AliasAnalysisOpInterface.
+void addLocalLoadNoAliasScopeAttrs(Operation *llLoadOp);
 // Attaches the "AsyncCopies" alias scope to llLoadDirectToLdsOp
 void addAsyncCopyAliasScope(LLVM::AliasAnalysisOpInterface llLoadDirectToLdsOp);
 

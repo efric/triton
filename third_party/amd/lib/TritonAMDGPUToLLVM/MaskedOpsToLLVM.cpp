@@ -1,22 +1,248 @@
+#include "MaskedOpsToLLVM.h"
+
 #include "AsyncUtility.h"
-#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "Utility.h"
-#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
-#include "triton/Tools/Sys/GetEnv.h"
 #include <tuple>
 
 using namespace mlir;
 using namespace mlir::triton::gpu;
 
+namespace mlir::triton {
+#define GEN_PASS_DEF_TRITONAMDGPUMASKEDOPSTOLLVM
+#include "TritonAMDGPUToLLVM/Passes.h.inc"
+} // namespace mlir::triton
+
+namespace mlir::triton::AMD {
+
+Value createRegularLoadFromMaskedOp(RewriterBase &rewriter, Location loc,
+                                    amdgpu::MaskedLoadOp loadOp) {
+  Type elemTy = loadOp.getResult().getType();
+  Value ptr = loadOp.getPtr();
+  triton::CacheModifier cacheMod = loadOp.getCache();
+
+  bool volatileFlag, nonTmpFlag;
+  std::tie(volatileFlag, nonTmpFlag) =
+      mlir::LLVM::AMD::getCacheModifierFlagsForLoadStore(
+          cacheMod, mlir::LLVM::AMD::MemoryOp::Load);
+
+  //              | volatile | non-tmp | gcn instr gfx94
+  // LLVM::LoadOp | 0        | 0       | (ca) global load
+  //              | 0/1      | 1       | (cg) global load nt
+  //              | 1        | 0       | (cv) flat load sc0 sc1
+  auto load = LLVM::LoadOp::create(rewriter, loc, elemTy, ptr, /*alignment=*/0,
+                                   volatileFlag, nonTmpFlag);
+  if (loadOp.getForceNoAlias())
+    AMD::addLocalLoadNoAliasScope(load);
+  return load;
+}
+
+Value createUnmaskedLoadFromMaskedOp(RewriterBase &rewriter, Location loc,
+                                     amdgpu::MaskedLoadOp loadOp,
+                                     const TargetInfo &targetInfo,
+                                     bool emitFallbackRemark) {
+  Value multicastMask = loadOp.getMulticastMask();
+  if (!multicastMask)
+    return createRegularLoadFromMaskedOp(rewriter, loc, loadOp);
+
+  TritonLLVMOpBuilder b(loc, rewriter);
+  Type elemTy = loadOp.getResult().getType();
+  Value ptr = loadOp.getPtr();
+  triton::CacheModifier cacheMod = loadOp.getCache();
+
+  int vecBits = 0;
+  if (auto vecTy = dyn_cast<VectorType>(elemTy)) {
+    vecBits = vecTy.getNumElements() * vecTy.getElementTypeBitWidth();
+  } else {
+    vecBits = elemTy.getIntOrFloatBitWidth();
+  }
+  assert(vecBits != 0);
+
+  // We can only multicast for 32, 64, 128 bit load size (hw limitation).
+  if (targetInfo.supportsClusterLoadBitWidth(vecBits)) {
+    std::string intrinsic =
+        "llvm.amdgcn.cluster.load.b" + std::to_string(vecBits);
+    auto cacheModBits = LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
+        cacheMod, true, targetInfo);
+    // The intrinsics only work with int32 or vec of int32 for >32bit.
+    Type resTy = i32_ty;
+    if (vecBits > 32)
+      resTy = vec_ty(i32_ty, vecBits / 32);
+    auto clusterLoadOp = LLVM::createLLVMIntrinsicCallOp(
+        rewriter, loc, intrinsic, {resTy},
+        {ptr, b.i32_val(cacheModBits), multicastMask});
+    if (loadOp.getForceNoAlias())
+      AMD::addLocalLoadNoAliasScopeAttrs(clusterLoadOp);
+    return b.bitcast(clusterLoadOp->getResult(0), elemTy);
+  }
+
+  if (emitFallbackRemark) {
+    loadOp.emitRemark()
+        << "Multicast with bit width " << vecBits << " is not supported on "
+        << targetInfo.getArch() << " falling back to regular load";
+  }
+  return createRegularLoadFromMaskedOp(rewriter, loc, loadOp);
+}
+
+LLVM::StoreOp createUnmaskedStoreFromMaskedOp(RewriterBase &rewriter,
+                                              Location loc,
+                                              amdgpu::MaskedStoreOp storeOp) {
+  Value val = storeOp.getValue();
+  Type elemTy = val.getType();
+  Value ptr = storeOp.getPtr();
+
+  bool volatileFlag, nonTmpFlag;
+  std::tie(volatileFlag, nonTmpFlag) =
+      mlir::LLVM::AMD::getCacheModifierFlagsForLoadStore(
+          storeOp.getCache(), mlir::LLVM::AMD::MemoryOp::Store);
+
+  int alignment = 0;
+  if (auto vecTy = dyn_cast<VectorType>(elemTy)) {
+    Type vecElemTy = vecTy.getElementType();
+    int elemSizeInBytes = vecElemTy.getIntOrFloatBitWidth() / 8;
+    alignment = elemSizeInBytes * vecTy.getNumElements();
+  }
+
+  //               | volatile | non-tmp | gcn instr gfx94
+  // LLVM::StoreOp | 0        | 0       | (cg) global store
+  //               | 0        | 1       | (cs) global store nt
+  //               | 1        | 0/1     | (wt) global store sc0 sc1
+  auto store = LLVM::StoreOp::create(rewriter, loc, val, ptr, alignment,
+                                     volatileFlag, nonTmpFlag);
+  if (storeOp.getForceNoAlias())
+    AMD::addLocalLoadNoAliasScope(store);
+  return store;
+}
+
+} // namespace mlir::triton::AMD
+
 namespace {
+
+static LogicalResult
+lowerMaskedRegionOp(triton::amdgpu::MaskedRegionOp regionOp,
+                    RewriterBase &rewriter) {
+  Location loc = regionOp.getLoc();
+  Region &region = regionOp.getBody();
+  if (!region.hasOneBlock())
+    return regionOp.emitOpError("expected one body block");
+
+  Block *body = &region.front();
+  auto yield = dyn_cast<triton::amdgpu::MaskedYieldOp>(body->getTerminator());
+  if (!yield)
+    return regionOp.emitOpError("expected `amdg.masked_yield` terminator");
+
+  rewriter.setInsertionPoint(regionOp);
+  if (mlir::matchPattern(regionOp.getMask(), mlir::m_One())) {
+    ValueRange results = yield.getValues();
+    rewriter.inlineBlockBefore(body, regionOp, {});
+    rewriter.replaceOp(regionOp, results);
+    rewriter.eraseOp(yield);
+    return success();
+  }
+
+  Block *currentBlock = rewriter.getInsertionBlock();
+  Block *afterRegion =
+      rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+  auto joinArgs = afterRegion->addArguments(
+      regionOp.getResultTypes(),
+      SmallVector<Location>(regionOp.getNumResults(), loc));
+  SmallVector<Value> replacementValues(joinArgs.begin(), joinArgs.end());
+
+  Block *trueBlock = rewriter.createBlock(afterRegion);
+
+  rewriter.setInsertionPointToEnd(currentBlock);
+  LLVM::CondBrOp::create(rewriter, loc, regionOp.getMask(), trueBlock,
+                         ValueRange{}, afterRegion, regionOp.getFalseValues());
+
+  rewriter.inlineBlockBefore(body, trueBlock, trueBlock->end(), {});
+
+  rewriter.setInsertionPoint(yield);
+  LLVM::BrOp::create(rewriter, loc, yield.getValues(), afterRegion);
+  rewriter.eraseOp(yield);
+
+  rewriter.replaceOp(regionOp, replacementValues);
+  return success();
+}
+
+static void lowerMaskedLoadOp(triton::amdgpu::MaskedLoadOp loadOp,
+                              const AMD::TargetInfo &targetInfo,
+                              RewriterBase &rewriter) {
+  Location loc = loadOp.getLoc();
+  Value mask = loadOp.getMask();
+  Value falseVal = loadOp.getFalseVal();
+
+  rewriter.setInsertionPoint(loadOp);
+  if (mlir::matchPattern(mask, mlir::m_One())) {
+    Value loadResult =
+        AMD::createUnmaskedLoadFromMaskedOp(rewriter, loc, loadOp, targetInfo);
+    rewriter.replaceOp(loadOp, loadResult);
+    return;
+  }
+
+  Type elemTy = loadOp.getResult().getType();
+  Block *currentBlock = rewriter.getInsertionBlock();
+  Block *afterLoad =
+      rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+  afterLoad->addArgument(elemTy, loc);
+
+  Block *trueBlock = rewriter.createBlock(afterLoad);
+
+  rewriter.setInsertionPointToEnd(currentBlock);
+  LLVM::CondBrOp::create(rewriter, loc, mask, trueBlock, ValueRange{},
+                         afterLoad, ValueRange{falseVal});
+
+  rewriter.setInsertionPointToStart(trueBlock);
+  Value loadResult =
+      AMD::createUnmaskedLoadFromMaskedOp(rewriter, loc, loadOp, targetInfo);
+  LLVM::BrOp::create(rewriter, loc, ValueRange{loadResult}, afterLoad);
+
+  rewriter.replaceOp(loadOp, afterLoad->getArgument(0));
+}
+
+static void lowerMaskedStoreOp(triton::amdgpu::MaskedStoreOp storeOp,
+                               RewriterBase &rewriter) {
+  Location loc = storeOp.getLoc();
+  Value mask = storeOp.getMask();
+
+  rewriter.setInsertionPoint(storeOp);
+  if (mlir::matchPattern(mask, mlir::m_One())) {
+    AMD::createUnmaskedStoreFromMaskedOp(rewriter, loc, storeOp);
+    rewriter.eraseOp(storeOp);
+    return;
+  }
+
+  Block *currentBlock = rewriter.getInsertionBlock();
+  Block *afterStore =
+      rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+  Block *trueBlock = rewriter.createBlock(afterStore);
+
+  rewriter.setInsertionPointToEnd(currentBlock);
+  LLVM::CondBrOp::create(rewriter, loc, mask, trueBlock, afterStore);
+
+  rewriter.setInsertionPointToStart(trueBlock);
+  AMD::createUnmaskedStoreFromMaskedOp(rewriter, loc, storeOp);
+  LLVM::BrOp::create(rewriter, loc, afterStore);
+
+  rewriter.eraseOp(storeOp);
+}
+
+class ConvertMaskedRegionOp
+    : public OpRewritePattern<triton::amdgpu::MaskedRegionOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::amdgpu::MaskedRegionOp regionOp,
+                                PatternRewriter &rewriter) const override {
+    return lowerMaskedRegionOp(regionOp, rewriter);
+  }
+};
 
 class ConvertMaskedLoadOp
     : public OpRewritePattern<triton::amdgpu::MaskedLoadOp> {
@@ -26,86 +252,7 @@ public:
 
   LogicalResult matchAndRewrite(triton::amdgpu::MaskedLoadOp loadOp,
                                 PatternRewriter &rewriter) const override {
-    auto loc = loadOp.getLoc();
-    TritonLLVMOpBuilder b(loc, rewriter);
-    auto elemTy = loadOp.getResult().getType();
-    auto ptr = loadOp.getPtr();
-    auto mask = loadOp.getMask();
-    auto falseVal = loadOp.getFalseVal();
-    auto multicastMask = loadOp.getMulticastMask();
-    auto cacheMod = loadOp.getCache();
-
-    bool volatileFlag, nonTmpFlag;
-    std::tie(volatileFlag, nonTmpFlag) =
-        mlir::LLVM::AMD::getCacheModifierFlagsForLoadStore(
-            cacheMod, mlir::LLVM::AMD::MemoryOp::Load);
-
-    auto createLoadWithAttrs = [&](Location loadLoc) -> Value {
-      int vecBits = 0;
-      if (auto vecTy = dyn_cast<VectorType>(elemTy)) {
-        vecBits = vecTy.getNumElements() * vecTy.getElementTypeBitWidth();
-      } else {
-        vecBits = elemTy.getIntOrFloatBitWidth();
-      }
-      assert(vecBits != 0);
-      // We can only multicast for 32, 64, 128 bit load size (hw limitation)
-      if (multicastMask && targetInfo.supportsClusterLoadBitWidth(vecBits)) {
-        std::string intrinsic =
-            "llvm.amdgcn.cluster.load.b" + std::to_string(vecBits);
-        auto cacheModBits = LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
-            cacheMod, true, targetInfo);
-        // The intrinsics only works with int32 or vec of int32 for >32bit
-        Type resTy = i32_ty;
-        if (vecBits > 32) {
-          resTy = vec_ty(i32_ty, vecBits / 32);
-        }
-        auto clusterLoadOp = LLVM::createLLVMIntrinsicCallOp(
-            rewriter, loc, intrinsic, {resTy},
-            {ptr, b.i32_val(cacheModBits), multicastMask});
-        return b.bitcast(clusterLoadOp->getResult(0), elemTy);
-      } else if (multicastMask) {
-        loadOp.emitRemark()
-            << "Multicast with bit width " << vecBits << " is not supported on "
-            << targetInfo.getArch() << " falling back to regular load";
-      }
-      // Emit a regular load
-      auto load =
-          LLVM::LoadOp::create(rewriter, loadLoc, elemTy, ptr, /*alignment*/ 0,
-                               volatileFlag, nonTmpFlag);
-      if (loadOp.getForceNoAlias()) {
-        AMD::addLocalLoadNoAliasScope(load);
-      }
-      return load;
-    };
-
-    bool useDirectLoad = mlir::matchPattern(mask, mlir::m_One());
-
-    if (useDirectLoad) {
-      auto loadResult = createLoadWithAttrs(loc);
-      rewriter.replaceOp(loadOp, loadResult);
-      return success();
-    }
-
-    Block *currentBlock = rewriter.getInsertionBlock();
-    Block *afterLoad =
-        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
-    afterLoad->addArgument({elemTy}, {loc});
-
-    Block *trueBlock = rewriter.createBlock(afterLoad);
-
-    rewriter.setInsertionPointToEnd(currentBlock);
-    LLVM::CondBrOp::create(rewriter, loc, mask, trueBlock, ValueRange{},
-                           afterLoad, ValueRange{falseVal});
-    rewriter.setInsertionPointToStart(trueBlock);
-    //              | vialatile | non-tmp | gcn instr gfx94
-    // LLVM::LoadOp | 0         | 0       | (ca) global load
-    //              | 0/1       | 1       | (cg) global load nt
-    //              | 1         | 0       | (cv) flat load sc0 sc1
-    auto loadResult = createLoadWithAttrs(loc);
-    LLVM::BrOp::create(rewriter, loc, ValueRange{loadResult}, afterLoad);
-
-    rewriter.replaceOp(loadOp, afterLoad->getArgument(0));
-
+    lowerMaskedLoadOp(loadOp, targetInfo, rewriter);
     return success();
   }
 
@@ -120,58 +267,23 @@ public:
 
   LogicalResult matchAndRewrite(triton::amdgpu::MaskedStoreOp storeOp,
                                 PatternRewriter &rewriter) const override {
-
-    auto loc = storeOp.getLoc();
-    auto val = storeOp.getValue();
-    auto elemTy = storeOp.getValue().getType();
-    auto ptr = storeOp.getPtr();
-    auto mask = storeOp.getMask();
-
-    bool volatileFlag, nonTmpFlag;
-    std::tie(volatileFlag, nonTmpFlag) =
-        mlir::LLVM::AMD::getCacheModifierFlagsForLoadStore(
-            storeOp.getCache(), mlir::LLVM::AMD::MemoryOp::Store);
-
-    int alignment = 0;
-    if (auto vecTy = dyn_cast<VectorType>(elemTy)) {
-      auto vecElemTy = vecTy.getElementType();
-      auto elemSizeInBytes = vecElemTy.getIntOrFloatBitWidth() / 8;
-      alignment = elemSizeInBytes * vecTy.getNumElements();
-    }
-
-    auto createStoreWithAttrs = [&](Location storeLoc) -> LLVM::StoreOp {
-      auto store = LLVM::StoreOp::create(rewriter, storeLoc, val, ptr,
-                                         alignment, volatileFlag, nonTmpFlag);
-      if (storeOp.getForceNoAlias()) {
-        AMD::addLocalLoadNoAliasScope(store);
-      }
-      return store;
-    };
-
-    bool useDirectStore = mlir::matchPattern(mask, mlir::m_One());
-
-    if (useDirectStore) {
-      createStoreWithAttrs(loc);
-      rewriter.eraseOp(storeOp);
-      return success();
-    }
-
-    Block *currentBlock = rewriter.getInsertionBlock();
-    Block *afterStore =
-        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
-    Block *trueBlock = rewriter.createBlock(afterStore);
-    rewriter.setInsertionPointToEnd(currentBlock);
-    LLVM::CondBrOp::create(rewriter, loc, mask, trueBlock, afterStore);
-    rewriter.setInsertionPointToStart(trueBlock);
-    //               | vialatile | non-tmp | gcn instr gfx94
-    // LLVM::StoreOp | 0         | 0       | (cg) global store
-    //               | 0         | 1       | (cs) global store nt
-    //               | 1         | 0/1     | (wt) global store sc0 sc1
-    createStoreWithAttrs(loc);
-    LLVM::BrOp::create(rewriter, loc, afterStore);
-    rewriter.setInsertionPointToStart(afterStore);
-    rewriter.eraseOp(storeOp);
+    lowerMaskedStoreOp(storeOp, rewriter);
     return success();
+  }
+};
+
+struct TritonAMDGPUMaskedOpsToLLVMPass
+    : public triton::impl::TritonAMDGPUMaskedOpsToLLVMBase<
+          TritonAMDGPUMaskedOpsToLLVMPass> {
+  explicit TritonAMDGPUMaskedOpsToLLVMPass(StringRef gfxArch) {
+    this->gfxArch = gfxArch.str();
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    AMD::TargetInfo targetInfo(this->gfxArch.getValue());
+    if (failed(AMD::lowerMaskedOpsToLLVM(module, targetInfo)))
+      signalPassFailure();
   }
 };
 
@@ -181,9 +293,47 @@ namespace mlir::triton::AMD {
 
 void populateMaskedOpsToLLVMPatterns(RewritePatternSet &patterns,
                                      const TargetInfo &targetInfo) {
+  patterns.add<ConvertMaskedRegionOp>(patterns.getContext());
   patterns.add<ConvertMaskedLoadOp>(patterns.getContext(), targetInfo);
   patterns.add<ConvertMaskedStoreOp>(patterns.getContext());
 }
-} // namespace mlir::triton::AMD
 
-// namespace mlir::triton
+LogicalResult lowerMaskedOpsToLLVM(ModuleOp module,
+                                   const TargetInfo &targetInfo) {
+  IRRewriter rewriter(module.getContext());
+
+  while (true) {
+    Operation *nextOp = nullptr;
+    module.walk([&](Operation *op) {
+      if (isa<triton::amdgpu::MaskedRegionOp, triton::amdgpu::MaskedLoadOp,
+              triton::amdgpu::MaskedStoreOp>(op)) {
+        nextOp = op;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+
+    if (!nextOp)
+      return success();
+
+    if (auto regionOp = dyn_cast<triton::amdgpu::MaskedRegionOp>(nextOp)) {
+      if (failed(lowerMaskedRegionOp(regionOp, rewriter)))
+        return failure();
+      continue;
+    }
+
+    if (auto loadOp = dyn_cast<triton::amdgpu::MaskedLoadOp>(nextOp)) {
+      lowerMaskedLoadOp(loadOp, targetInfo, rewriter);
+      continue;
+    }
+
+    lowerMaskedStoreOp(cast<triton::amdgpu::MaskedStoreOp>(nextOp), rewriter);
+  }
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createTritonAMDGPUMaskedOpsToLLVMPass(StringRef gfxArch) {
+  return std::make_unique<TritonAMDGPUMaskedOpsToLLVMPass>(gfxArch);
+}
+
+} // namespace mlir::triton::AMD
