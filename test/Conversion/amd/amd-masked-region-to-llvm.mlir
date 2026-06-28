@@ -122,16 +122,37 @@ module {
 
 // -----
 
-// GFX1250-LABEL: llvm.func @multicast_noalias_lowering
-// GFX1250: llvm.call_intrinsic "llvm.amdgcn.cluster.load.b32"{{.*}}alias_scopes{{.*}}noalias_scopes
+// CHECK-LABEL: llvm.func @regular_noalias_load
+// CHECK: llvm.load %{{.*}} {alias_scopes = {{.*}}noalias_scopes = {{.*}}} : !llvm.ptr -> i32
+// CHECK-NOT: amdg.masked_load
+// CHECK: llvm.return
+module {
+  llvm.func @regular_noalias_load(%src: !llvm.ptr, %dst: !llvm.ptr) {
+    %true = llvm.mlir.constant(true) : i1
+    %zero = llvm.mlir.constant(0 : i32) : i32
+    %value = amdg.masked_load %src, %true, %zero forceNoAlias true : (!llvm.ptr, i1, i32) -> i32
+    llvm.store %value, %dst : i32, !llvm.ptr
+    llvm.return
+  }
+}
+
+// -----
+
+// CHECK-LABEL: llvm.func @multicast_lowering
+// CHECK: llvm.load
+// CHECK-NOT: llvm.call_intrinsic "llvm.amdgcn.cluster.load.b32"
+// CHECK-NOT: amdg.masked_load
+// CHECK: llvm.return
+// GFX1250-LABEL: llvm.func @multicast_lowering
+// GFX1250: llvm.call_intrinsic "llvm.amdgcn.cluster.load.b32"
 // GFX1250-NOT: amdg.masked_load
 // GFX1250: llvm.return
 module {
-  llvm.func @multicast_noalias_lowering(%src: !llvm.ptr<1>, %dst: !llvm.ptr<1>) {
+  llvm.func @multicast_lowering(%src: !llvm.ptr<1>, %dst: !llvm.ptr<1>) {
     %true = llvm.mlir.constant(true) : i1
     %zero = llvm.mlir.constant(0 : i32) : i32
     %multicast = llvm.mlir.constant(3 : i32) : i32
-    %value = amdg.masked_load %src, %true, %zero, %multicast cacheModifier = ca forceNoAlias true : (!llvm.ptr<1>, i1, i32, i32) -> i32
+    %value = amdg.masked_load %src, %true, %zero, %multicast cacheModifier = ca : (!llvm.ptr<1>, i1, i32, i32) -> i32
     llvm.store %value, %dst : i32, !llvm.ptr<1>
     llvm.return
   }

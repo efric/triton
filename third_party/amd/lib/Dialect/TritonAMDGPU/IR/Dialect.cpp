@@ -141,33 +141,34 @@ LogicalResult verifyTDMCommonLayout(Operation *op,
 }
 
 LogicalResult verifyMaskedRegionBodyOp(Operation *op) {
-  if (isa<MaskedYieldOp>(op))
-    return success();
-  if (isa<MaskedRegionOp>(op))
-    return op->emitOpError("cannot be nested in `amdg.masked_region`");
-  if (op->getNumRegions() != 0)
-    return op->emitOpError("with nested regions is not supported in "
-                           "`amdg.masked_region`");
-
-  if (auto load = dyn_cast<LLVM::LoadOp>(op)) {
-    if (load.getOrdering() != LLVM::AtomicOrdering::not_atomic)
-      return load.emitOpError("is not supported in `amdg.masked_region`")
-             << " because it is atomic";
-    return success();
-  }
-
-  if (auto store = dyn_cast<LLVM::StoreOp>(op)) {
-    if (store.getOrdering() != LLVM::AtomicOrdering::not_atomic)
-      return store.emitOpError("is not supported in `amdg.masked_region`")
-             << " because it is atomic";
-    return success();
-  }
-
-  if (isMemoryEffectFree(op))
-    return success();
-
-  return op->emitOpError(
-      "has unsupported side effects in `amdg.masked_region`");
+  return llvm::TypeSwitch<Operation *, LogicalResult>(op)
+      .Case<MaskedYieldOp>([](MaskedYieldOp) -> LogicalResult {
+        return success();
+      })
+      .Case<MaskedRegionOp>([](MaskedRegionOp regionOp) -> LogicalResult {
+        return regionOp.emitOpError("cannot be nested in `amdg.masked_region`");
+      })
+      .Case<LLVM::LoadOp>([](LLVM::LoadOp load) -> LogicalResult {
+        if (load.getOrdering() != LLVM::AtomicOrdering::not_atomic)
+          return load.emitOpError("is not supported in `amdg.masked_region`")
+                 << " because it is atomic";
+        return success();
+      })
+      .Case<LLVM::StoreOp>([](LLVM::StoreOp store) -> LogicalResult {
+        if (store.getOrdering() != LLVM::AtomicOrdering::not_atomic)
+          return store.emitOpError("is not supported in `amdg.masked_region`")
+                 << " because it is atomic";
+        return success();
+      })
+      .Default([](Operation *op) -> LogicalResult {
+        if (op->getNumRegions() != 0)
+          return op->emitOpError("with nested regions is not supported in "
+                                 "`amdg.masked_region`");
+        if (isMemoryEffectFree(op))
+          return success();
+        return op->emitOpError(
+            "has unsupported side effects in `amdg.masked_region`");
+      });
 }
 
 } // namespace

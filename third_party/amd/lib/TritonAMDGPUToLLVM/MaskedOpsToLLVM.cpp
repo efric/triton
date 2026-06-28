@@ -10,6 +10,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include <tuple>
 
 using namespace mlir;
@@ -78,8 +79,6 @@ Value createUnmaskedLoadFromMaskedOp(RewriterBase &rewriter, Location loc,
     auto clusterLoadOp = LLVM::createLLVMIntrinsicCallOp(
         rewriter, loc, intrinsic, {resTy},
         {ptr, b.i32_val(cacheModBits), multicastMask});
-    if (loadOp.getForceNoAlias())
-      AMD::addLocalLoadNoAliasScopeAttrs(clusterLoadOp);
     return b.bitcast(clusterLoadOp->getResult(0), elemTy);
   }
 
@@ -233,7 +232,7 @@ static void lowerMaskedStoreOp(triton::amdgpu::MaskedStoreOp storeOp,
   rewriter.eraseOp(storeOp);
 }
 
-class ConvertMaskedRegionOp
+class ConvertMaskedRegionOp final
     : public OpRewritePattern<triton::amdgpu::MaskedRegionOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
@@ -244,7 +243,7 @@ public:
   }
 };
 
-class ConvertMaskedLoadOp
+class ConvertMaskedLoadOp final
     : public OpRewritePattern<triton::amdgpu::MaskedLoadOp> {
 public:
   ConvertMaskedLoadOp(MLIRContext *context, const AMD::TargetInfo &targetInfo)
@@ -260,7 +259,7 @@ private:
   const AMD::TargetInfo &targetInfo;
 };
 
-class ConvertMaskedStoreOp
+class ConvertMaskedStoreOp final
     : public OpRewritePattern<triton::amdgpu::MaskedStoreOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
@@ -272,7 +271,7 @@ public:
   }
 };
 
-struct TritonAMDGPUMaskedOpsToLLVMPass
+struct TritonAMDGPUMaskedOpsToLLVMPass final
     : public triton::impl::TritonAMDGPUMaskedOpsToLLVMBase<
           TritonAMDGPUMaskedOpsToLLVMPass> {
   explicit TritonAMDGPUMaskedOpsToLLVMPass(StringRef gfxArch) {
@@ -316,18 +315,25 @@ LogicalResult lowerMaskedOpsToLLVM(ModuleOp module,
     if (!nextOp)
       return success();
 
-    if (auto regionOp = dyn_cast<triton::amdgpu::MaskedRegionOp>(nextOp)) {
-      if (failed(lowerMaskedRegionOp(regionOp, rewriter)))
-        return failure();
-      continue;
-    }
-
-    if (auto loadOp = dyn_cast<triton::amdgpu::MaskedLoadOp>(nextOp)) {
-      lowerMaskedLoadOp(loadOp, targetInfo, rewriter);
-      continue;
-    }
-
-    lowerMaskedStoreOp(cast<triton::amdgpu::MaskedStoreOp>(nextOp), rewriter);
+    if (failed(llvm::TypeSwitch<Operation *, LogicalResult>(nextOp)
+                   .Case<triton::amdgpu::MaskedRegionOp>(
+                       [&](auto regionOp) -> LogicalResult {
+                         return lowerMaskedRegionOp(regionOp, rewriter);
+                       })
+                   .Case<triton::amdgpu::MaskedLoadOp>(
+                       [&](auto loadOp) -> LogicalResult {
+                         lowerMaskedLoadOp(loadOp, targetInfo, rewriter);
+                         return success();
+                       })
+                   .Case<triton::amdgpu::MaskedStoreOp>(
+                       [&](auto storeOp) -> LogicalResult {
+                         lowerMaskedStoreOp(storeOp, rewriter);
+                         return success();
+                       })
+                   .Default([](Operation *) -> LogicalResult {
+                     return failure();
+                   })))
+      return failure();
   }
 }
 

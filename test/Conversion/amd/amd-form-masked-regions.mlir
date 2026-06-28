@@ -1,5 +1,4 @@
 // RUN: triton-opt %s -split-input-file --triton-amdgpu-form-masked-regions | FileCheck %s
-// RUN: triton-opt %s -split-input-file --triton-amdgpu-form-masked-regions='gfx-arch=gfx1250' | FileCheck %s --check-prefix=GFX1250
 
 // CHECK-LABEL: llvm.func @two_loads_same_mask
 // CHECK-SAME: (%[[ACTIVE:.*]]: i1
@@ -172,6 +171,34 @@ module {
 
 // -----
 
+// CHECK-LABEL: llvm.func @aggregate_mask_materialized_between_loads
+// CHECK: amdg.masked_region %{{.*}} else(%{{.*}}, %{{.*}}) {
+// CHECK:   llvm.load %{{.*}} : !llvm.ptr -> vector<1xi32>
+// CHECK:   llvm.load %{{.*}} : !llvm.ptr -> vector<1xi32>
+// CHECK:   amdg.masked_yield %{{.*}}, %{{.*}} : vector<1xi32>, vector<1xi32>
+// CHECK: } : vector<1xi32>, vector<1xi32> -> vector<1xi32>, vector<1xi32>
+// CHECK-NOT: amdg.masked_load
+// CHECK: llvm.return
+module {
+  llvm.func @aggregate_mask_materialized_between_loads(%active: i1, %src0: !llvm.ptr, %src1: !llvm.ptr, %dst: !llvm.ptr, %zero_vec: vector<1xi32>) {
+    %c0 = llvm.mlir.constant(0 : i32) : i32
+    %undef = llvm.mlir.undef : !llvm.struct<(i1, i1)>
+    %agg0 = llvm.insertvalue %active, %undef[0] : !llvm.struct<(i1, i1)>
+    %m0 = llvm.extractvalue %agg0[0] : !llvm.struct<(i1, i1)>
+    %v0 = amdg.masked_load %src0, %m0, %zero_vec : (!llvm.ptr, i1, vector<1xi32>) -> vector<1xi32>
+    %e0 = llvm.extractelement %v0[%c0 : i32] : vector<1xi32>
+    %agg1 = llvm.insertvalue %active, %agg0[1] : !llvm.struct<(i1, i1)>
+    %m1 = llvm.extractvalue %agg1[1] : !llvm.struct<(i1, i1)>
+    %v1 = amdg.masked_load %src1, %m1, %zero_vec : (!llvm.ptr, i1, vector<1xi32>) -> vector<1xi32>
+    %e1 = llvm.extractelement %v1[%c0 : i32] : vector<1xi32>
+    %sum = llvm.add %e0, %e1 : i32
+    llvm.store %sum, %dst : i32, !llvm.ptr
+    llvm.return
+  }
+}
+
+// -----
+
 // CHECK-LABEL: llvm.func @overlapping_aggregate_insert_blocks_grouping
 // CHECK-NOT: amdg.masked_region
 // CHECK: amdg.masked_load
@@ -332,11 +359,11 @@ module {
 
 // -----
 
-// GFX1250-LABEL: llvm.func @multicast_loads_do_not_form_region
-// GFX1250-NOT: amdg.masked_region
-// GFX1250: amdg.masked_load
-// GFX1250: amdg.masked_load
-// GFX1250: llvm.return
+// CHECK-LABEL: llvm.func @multicast_loads_do_not_form_region
+// CHECK-NOT: amdg.masked_region
+// CHECK: amdg.masked_load
+// CHECK: amdg.masked_load
+// CHECK: llvm.return
 module {
   llvm.func @multicast_loads_do_not_form_region(%active: i1, %src0: !llvm.ptr, %src1: !llvm.ptr) {
     %zero = llvm.mlir.constant(0 : i32) : i32

@@ -558,7 +558,8 @@ def MaskedRegionOp : TT_AMDGPU_Op<"masked_region",
     Groups scalar AMD masked memory operations that share the same i1 predicate.
     The region executes only when the predicate is true. Region results are
     yielded by amdg.masked_yield; false-path values are explicit operands on
-    the parent op.
+    the parent op. This op is a transient AMD LLVM-lowering helper and is
+    lowered to explicit LLVM control flow before leaving the AMD conversion.
   }];
 
   let arguments = (ins I1:$mask, Variadic<LLVM_Type>:$falseValues);

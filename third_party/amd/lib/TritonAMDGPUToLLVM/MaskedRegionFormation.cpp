@@ -8,6 +8,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/TypeSwitch.h"
 
 using namespace mlir;
 namespace AMD = mlir::triton::AMD;
@@ -22,31 +23,25 @@ namespace {
 constexpr int kMaxAggregateMaskResolutionDepth = 32;
 
 static Value getMaskedOpMask(Operation *op) {
-  if (auto load = dyn_cast<triton::amdgpu::MaskedLoadOp>(op)) {
-    if (load.getMulticastMask())
-      return {};
-    return load.getMask();
-  }
-  if (auto store = dyn_cast<triton::amdgpu::MaskedStoreOp>(op))
-    return store.getMask();
-  return {};
+  return llvm::TypeSwitch<Operation *, Value>(op)
+      .Case<triton::amdgpu::MaskedLoadOp>([](auto load) -> Value {
+        if (load.getMulticastMask())
+          return {};
+        return load.getMask();
+      })
+      .Case<triton::amdgpu::MaskedStoreOp>(
+          [](auto store) -> Value { return store.getMask(); })
+      .Default([](Operation *) -> Value { return {}; });
 }
 
 static bool isMaskedMemoryOp(Operation *op) {
   return static_cast<bool>(getMaskedOpMask(op));
 }
 
-static bool aggregatePositionsOverlap(ArrayRef<int64_t> lhs,
-                                      ArrayRef<int64_t> rhs) {
-  size_t commonSize = lhs.size() < rhs.size() ? lhs.size() : rhs.size();
-  for (size_t i = 0; i < commonSize; ++i) {
-    if (lhs[i] != rhs[i])
-      return false;
-  }
-  return true;
-}
+static Value resolveAggregateMask(Value mask, int depth = 0) {
+  if (depth >= kMaxAggregateMaskResolutionDepth)
+    return mask;
 
-static Value resolveAggregateMask(Value mask) {
   auto extract = mask.getDefiningOp<LLVM::ExtractValueOp>();
   if (!extract)
     return mask;
@@ -55,14 +50,19 @@ static Value resolveAggregateMask(Value mask) {
   // value inserted at the same aggregate position.
   Value aggregate = extract.getContainer();
   ArrayRef<int64_t> position = extract.getPosition();
-  for (int depth = 0; depth < kMaxAggregateMaskResolutionDepth; ++depth) {
+  for (; depth < kMaxAggregateMaskResolutionDepth; ++depth) {
     auto insert = aggregate.getDefiningOp<LLVM::InsertValueOp>();
     if (!insert)
       break;
     ArrayRef<int64_t> insertPosition = insert.getPosition();
     if (insertPosition == position)
-      return resolveAggregateMask(insert.getValue());
-    if (aggregatePositionsOverlap(insertPosition, position))
+      return resolveAggregateMask(insert.getValue(), depth + 1);
+
+    size_t commonSize = insertPosition.size() < position.size()
+                            ? insertPosition.size()
+                            : position.size();
+    if (llvm::equal(insertPosition.take_front(commonSize),
+                    position.take_front(commonSize)))
       break;
     aggregate = insert.getContainer();
   }
@@ -124,43 +124,14 @@ appendHoistDependency(Value value,
   return true;
 }
 
-static bool
-isEscapedExtractOfMovedLoad(Operation *op,
-                            const llvm::SmallPtrSetImpl<Operation *> &moveSet) {
-  if (!isa<LLVM::ExtractElementOp>(op))
-    return false;
-  Operation *defOp = op->getOperand(0).getDefiningOp();
-  return isa_and_nonnull<triton::amdgpu::MaskedLoadOp>(defOp) &&
-         moveSet.contains(defOp);
-}
-
-static bool isMaskedLoadFalseValueUse(Operation *owner, OpOperand &use) {
-  auto load = dyn_cast<triton::amdgpu::MaskedLoadOp>(owner);
-  return load && use.getOperandNumber() == 2;
-}
-
-static bool hasResultUseInMoveSetOutsideFalseValues(
-    Operation *op, const llvm::SmallPtrSetImpl<Operation *> &moveSet) {
-  for (Value result : op->getResults()) {
-    for (OpOperand &use : result.getUses()) {
-      Operation *owner = use.getOwner();
-      if (!moveSet.contains(owner))
-        continue;
-      if (isMaskedLoadFalseValueUse(owner, use))
-        continue;
-      return true;
-    }
-  }
-  return false;
-}
-
 struct ClusterPlan {
+  SmallVector<Operation *> intervalOps;
   SmallVector<Operation *> opsToMove;
   SmallVector<Operation *> opsToHoist;
 };
 
 static FailureOr<ClusterPlan>
-computeClusterPlan(ArrayRef<Operation *> intervalOps, Value mask) {
+computeClusterPlan(SmallVector<Operation *> intervalOps, Value mask) {
   llvm::SmallPtrSet<Operation *, 16> intervalSet(intervalOps.begin(),
                                                  intervalOps.end());
   Value canonicalMask = resolveAggregateMask(mask);
@@ -232,8 +203,29 @@ computeClusterPlan(ArrayRef<Operation *> intervalOps, Value mask) {
       continue;
     }
 
-    if (hasResultUseInMoveSetOutsideFalseValues(op, moveSet))
-      return failure();
+    for (Value result : op->getResults()) {
+      for (OpOperand &use : result.getUses()) {
+        Operation *owner = use.getOwner();
+        if (!moveSet.contains(owner))
+          continue;
+        bool isErasedOperand =
+            llvm::TypeSwitch<Operation *, bool>(owner)
+                .Case<triton::amdgpu::MaskedLoadOp>([&](auto load) {
+                  return use.getOperandNumber() ==
+                             load.getMaskMutable().getOperandNumber() ||
+                         use.getOperandNumber() ==
+                             load.getFalseValMutable().getOperandNumber();
+                })
+                .Case<triton::amdgpu::MaskedStoreOp>([&](auto store) {
+                  return use.getOperandNumber() ==
+                         store.getMaskMutable().getOperandNumber();
+                })
+                .Default([](Operation *) { return false; });
+        if (isErasedOperand)
+          continue;
+        return failure();
+      }
+    }
 
     bool hasMovedOperand = false;
     for (Value operand : op->getOperands()) {
@@ -246,30 +238,26 @@ computeClusterPlan(ArrayRef<Operation *> intervalOps, Value mask) {
     }
 
     if (hasResultUseOutside(op, intervalSet)) {
-      if (!hasMovedOperand || !isEscapedExtractOfMovedLoad(op, moveSet))
+      auto extract = dyn_cast<LLVM::ExtractElementOp>(op);
+      Operation *defOp = extract ? extract->getOperand(0).getDefiningOp()
+                                 : nullptr;
+      if (!hasMovedOperand ||
+          !isa_and_nonnull<triton::amdgpu::MaskedLoadOp>(defOp) ||
+          !moveSet.contains(defOp))
         return failure();
     }
   }
 
-  return ClusterPlan{std::move(opsToMove), std::move(opsToHoist)};
+  return ClusterPlan{std::move(intervalOps), std::move(opsToMove),
+                     std::move(opsToHoist)};
 }
 
-static SmallVector<Operation *> getInterval(Operation *first, Operation *last) {
-  SmallVector<Operation *> interval;
-  for (Operation *op = first;; op = op->getNextNode()) {
-    interval.push_back(op);
-    if (op == last)
-      break;
-  }
-  return interval;
-}
-
-static FailureOr<SmallVector<Operation *>> findCluster(Operation *first) {
+static FailureOr<ClusterPlan> findCluster(Operation *first) {
   Value mask = getMaskedOpMask(first);
   if (!mask)
     return failure();
 
-  unsigned maskedOpCount = 1;
+  int maskedOpCount = 1;
   Operation *lastMaskedOp = first;
   Value canonicalMask = resolveAggregateMask(mask);
   for (Operation *op = first->getNextNode(); op != nullptr;
@@ -292,56 +280,28 @@ static FailureOr<SmallVector<Operation *>> findCluster(Operation *first) {
   if (maskedOpCount < 2)
     return failure();
 
-  SmallVector<Operation *> intervalOps = getInterval(first, lastMaskedOp);
-  if (failed(computeClusterPlan(intervalOps, mask)))
-    return failure();
-
-  return intervalOps;
-}
-
-static triton::amdgpu::MaskedRegionOp
-createMaskedRegionOp(IRRewriter &rewriter, Location loc, Value mask,
-                     ValueRange falseValues, TypeRange resultTypes) {
-  OperationState state(loc, triton::amdgpu::MaskedRegionOp::getOperationName());
-  state.addOperands(mask);
-  state.addOperands(falseValues);
-  state.addTypes(resultTypes);
-  state.addRegion();
-  return cast<triton::amdgpu::MaskedRegionOp>(rewriter.create(state));
-}
-
-static void replaceGroupedLoadUses(
-    triton::amdgpu::MaskedLoadOp load, Value trueValue, Value outsideValue,
-    const llvm::SmallPtrSetImpl<Operation *> &moveSet, IRRewriter &rewriter) {
-  SmallVector<OpOperand *> uses;
-  for (OpOperand &use : load.getResult().getUses())
-    uses.push_back(&use);
-
-  for (OpOperand *use : uses) {
-    Operation *owner = use->getOwner();
-    bool useMovedIntoRegion = moveSet.contains(owner);
-    if (!useMovedIntoRegion)
-      assert(outsideValue && "expected region result for outside use");
-    Value replacement = useMovedIntoRegion ? trueValue : outsideValue;
-    rewriter.modifyOpInPlace(owner, [&]() { use->set(replacement); });
+  SmallVector<Operation *> intervalOps;
+  for (Operation *op = first;; op = op->getNextNode()) {
+    intervalOps.push_back(op);
+    if (op == lastMaskedOp)
+      break;
   }
+
+  return computeClusterPlan(std::move(intervalOps), mask);
 }
 
-static void formMaskedRegion(ArrayRef<Operation *> intervalOps,
-                             IRRewriter &rewriter) {
-  Operation *first = intervalOps.front();
+static void formMaskedRegion(const ClusterPlan &plan, IRRewriter &rewriter) {
+  Operation *first = plan.intervalOps.front();
   Location loc = first->getLoc();
   Value mask = getMaskedOpMask(first);
-  FailureOr<ClusterPlan> plan = computeClusterPlan(intervalOps, mask);
-  assert(succeeded(plan) && "expected legal masked region cluster");
-  llvm::SmallPtrSet<Operation *, 16> moveSet(plan->opsToMove.begin(),
-                                             plan->opsToMove.end());
+  llvm::SmallPtrSet<Operation *, 16> moveSet(plan.opsToMove.begin(),
+                                             plan.opsToMove.end());
 
   SmallVector<triton::amdgpu::MaskedLoadOp> loads;
   SmallVector<Value> falseValues;
   SmallVector<Type> resultTypes;
   DenseMap<Operation *, unsigned> loadToResultIndex;
-  for (Operation *op : plan->opsToMove) {
+  for (Operation *op : plan.opsToMove) {
     auto load = dyn_cast<triton::amdgpu::MaskedLoadOp>(op);
     if (!load)
       continue;
@@ -353,15 +313,15 @@ static void formMaskedRegion(ArrayRef<Operation *> intervalOps,
     resultTypes.push_back(load.getResult().getType());
   }
 
-  for (Operation *op : plan->opsToHoist)
+  for (Operation *op : plan.opsToHoist)
     rewriter.moveOpBefore(op, first);
 
   rewriter.setInsertionPoint(first);
-  auto regionOp = createMaskedRegionOp(rewriter, loc, mask, falseValues,
-                                       TypeRange(resultTypes));
+  auto regionOp = triton::amdgpu::MaskedRegionOp::create(
+      rewriter, loc, TypeRange(resultTypes), mask, falseValues);
   Block *body = rewriter.createBlock(&regionOp.getBody());
 
-  for (Operation *op : plan->opsToMove)
+  for (Operation *op : plan.opsToMove)
     rewriter.moveOpBefore(op, body, body->end());
 
   SmallVector<Value> yieldValues(loads.size());
@@ -377,7 +337,17 @@ static void formMaskedRegion(ArrayRef<Operation *> intervalOps,
         yieldValues[resultIndex] = trueValue;
         outsideValue = regionOp.getResult(resultIndex);
       }
-      replaceGroupedLoadUses(load, trueValue, outsideValue, moveSet, rewriter);
+      SmallVector<OpOperand *> uses;
+      for (OpOperand &use : load.getResult().getUses())
+        uses.push_back(&use);
+      for (OpOperand *use : uses) {
+        Operation *owner = use->getOwner();
+        bool useMovedIntoRegion = moveSet.contains(owner);
+        if (!useMovedIntoRegion)
+          assert(outsideValue && "expected region result for outside use");
+        Value replacement = useMovedIntoRegion ? trueValue : outsideValue;
+        rewriter.modifyOpInPlace(owner, [&]() { use->set(replacement); });
+      }
       rewriter.eraseOp(load);
       continue;
     }
@@ -408,7 +378,7 @@ static bool runOnBlock(Block &block, IRRewriter &rewriter) {
     if (op->getBlock() != &block || !isMaskedMemoryOp(op))
       continue;
 
-    FailureOr<SmallVector<Operation *>> cluster = findCluster(op);
+    FailureOr<ClusterPlan> cluster = findCluster(op);
     if (failed(cluster))
       continue;
 
@@ -419,13 +389,9 @@ static bool runOnBlock(Block &block, IRRewriter &rewriter) {
   return false;
 }
 
-struct TritonAMDGPUFormMaskedRegionsPass
+struct TritonAMDGPUFormMaskedRegionsPass final
     : public triton::impl::TritonAMDGPUFormMaskedRegionsBase<
           TritonAMDGPUFormMaskedRegionsPass> {
-  explicit TritonAMDGPUFormMaskedRegionsPass(StringRef gfxArch) {
-    this->gfxArch = gfxArch.str();
-  }
-
   void runOnOperation() override {
     ModuleOp module = getOperation();
     AMD::formMaskedRegions(module);
@@ -457,8 +423,8 @@ void formMaskedRegions(ModuleOp module) {
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>
-createTritonAMDGPUFormMaskedRegionsPass(StringRef gfxArch) {
-  return std::make_unique<TritonAMDGPUFormMaskedRegionsPass>(gfxArch);
+createTritonAMDGPUFormMaskedRegionsPass() {
+  return std::make_unique<TritonAMDGPUFormMaskedRegionsPass>();
 }
 
 } // namespace mlir::triton::AMD

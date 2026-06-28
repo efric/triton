@@ -58,16 +58,11 @@ def ConvertBuiltinFuncToLLVM : Pass<"convert-builtin-func-to-llvm", "mlir::Modul
 
 def TritonAMDGPUFormMaskedRegions : Pass<"triton-amdgpu-form-masked-regions", "mlir::ModuleOp"> {
     let summary = "Group same-mask AMD scalar masked memory ops into masked regions";
-    let constructor = "mlir::triton::AMD::createTritonAMDGPUFormMaskedRegionsPass(\"\")";
+    let constructor = "mlir::triton::AMD::createTritonAMDGPUFormMaskedRegionsPass()";
 
     let dependentDialects = ["mlir::LLVM::LLVMDialect",
                              "mlir::ROCDL::ROCDLDialect",
                              "mlir::triton::amdgpu::TritonAMDGPUDialect"];
-
-    let options = [
-        Option<"gfxArch", "gfx-arch", "std::string", /*default*/"std::string{}",
-               "Specify the GFX architecture name, e.g., gfx942, gfx950, etc.">,
-    ];
 }
 
 def TritonAMDGPUMaskedOpsToLLVM : Pass<"triton-amdgpu-masked-ops-to-llvm", "mlir::ModuleOp"> {

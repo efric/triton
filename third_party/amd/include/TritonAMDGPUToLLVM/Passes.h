@@ -30,7 +30,7 @@ createConvertWarpPipelinePass(StringRef gfxArch);
 std::unique_ptr<OperationPass<ModuleOp>>
 createTritonAMDGPUConvertWarpSpecializeToLLVMPass(StringRef gfxArch);
 std::unique_ptr<OperationPass<ModuleOp>>
-createTritonAMDGPUFormMaskedRegionsPass(StringRef gfxArch);
+createTritonAMDGPUFormMaskedRegionsPass();
 std::unique_ptr<OperationPass<ModuleOp>>
 createTritonAMDGPUMaskedOpsToLLVMPass(StringRef gfxArch);
 void runScalarizePackedFOpsPass(llvm::Function &F);

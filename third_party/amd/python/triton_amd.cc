@@ -52,11 +52,9 @@ void init_triton_amd_passes_ttgpuir(py::module_ &m) {
         [](mlir::PassManager &pm, const std::string &arch, bool ftz) {
           pm.addPass(createConvertTritonAMDGPUToLLVMPass(arch, ftz));
         });
-  m.def("add_form_masked_regions",
-        [](mlir::PassManager &pm, const std::string &arch) {
-          pm.addPass(
-              mlir::triton::AMD::createTritonAMDGPUFormMaskedRegionsPass(arch));
-        });
+  m.def("add_form_masked_regions", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::AMD::createTritonAMDGPUFormMaskedRegionsPass());
+  });
   m.def("add_masked_ops_to_llvmir",
         [](mlir::PassManager &pm, const std::string &arch) {
           pm.addPass(
