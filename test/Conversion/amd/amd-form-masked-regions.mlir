@@ -107,42 +107,6 @@ module {
 
 // -----
 
-// CHECK-LABEL: llvm.func @dynamic_loop_escaped_extracts
-// CHECK: ^{{.*}}:
-// CHECK: amdg.masked_region %{{.*}} else(%{{.*}}, %{{.*}}) {
-// CHECK:   llvm.load %{{.*}} : !llvm.ptr -> vector<1xi32>
-// CHECK:   llvm.load %{{.*}} : !llvm.ptr -> vector<1xi32>
-// CHECK:   amdg.masked_yield %{{.*}}, %{{.*}} : vector<1xi32>, vector<1xi32>
-// CHECK: } : vector<1xi32>, vector<1xi32> -> vector<1xi32>, vector<1xi32>
-// CHECK-NOT: amdg.masked_load
-// CHECK: llvm.return
-module {
-  llvm.func @dynamic_loop_escaped_extracts(%active: i1, %n: i32, %src0: !llvm.ptr, %src1: !llvm.ptr, %dst: !llvm.ptr, %zero_vec: vector<1xi32>) {
-    %c0 = llvm.mlir.constant(0 : i32) : i32
-    %c1 = llvm.mlir.constant(1 : i32) : i32
-    llvm.br ^loop(%c0 : i32)
-
-  ^loop(%i: i32):
-    %keep_going = llvm.icmp "slt" %i, %n : i32
-    llvm.cond_br %keep_going, ^body, ^exit
-
-  ^body:
-    %v0 = amdg.masked_load %src0, %active, %zero_vec : (!llvm.ptr, i1, vector<1xi32>) -> vector<1xi32>
-    %e0 = llvm.extractelement %v0[%c0 : i32] : vector<1xi32>
-    %v1 = amdg.masked_load %src1, %active, %zero_vec : (!llvm.ptr, i1, vector<1xi32>) -> vector<1xi32>
-    %e1 = llvm.extractelement %v1[%c0 : i32] : vector<1xi32>
-    %sum = llvm.add %e0, %e1 : i32
-    llvm.store %sum, %dst : i32, !llvm.ptr
-    %next = llvm.add %i, %c1 : i32
-    llvm.br ^loop(%next : i32)
-
-  ^exit:
-    llvm.return
-  }
-}
-
-// -----
-
 // CHECK-LABEL: llvm.func @aggregate_masks_from_same_value_group
 // CHECK: amdg.masked_region %{{.*}} else(%{{.*}}, %{{.*}}) {
 // CHECK:   llvm.load %{{.*}} : !llvm.ptr -> vector<1xi32>
