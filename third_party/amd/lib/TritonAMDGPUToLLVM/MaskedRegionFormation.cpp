@@ -34,10 +34,6 @@ static Value getMaskedOpMask(Operation *op) {
       .Default([](Operation *) -> Value { return {}; });
 }
 
-static bool isMaskedMemoryOp(Operation *op) {
-  return static_cast<bool>(getMaskedOpMask(op));
-}
-
 static Value resolveAggregateMask(Value mask, int depth = 0) {
   if (depth >= kMaxAggregateMaskResolutionDepth)
     return mask;
@@ -98,7 +94,7 @@ static bool appendDependency(Value value,
   Operation *defOp = value.getDefiningOp();
   if (!defOp || !interval.contains(defOp))
     return true;
-  if (isMaskedMemoryOp(defOp))
+  if (getMaskedOpMask(defOp))
     return moveSet.contains(defOp);
   if (!isMovablePureOp(defOp))
     return false;
@@ -116,7 +112,7 @@ appendHoistDependency(Value value,
   Operation *defOp = value.getDefiningOp();
   if (!defOp || !interval.contains(defOp))
     return true;
-  if (moveSet.contains(defOp) || isMaskedMemoryOp(defOp) ||
+  if (moveSet.contains(defOp) || getMaskedOpMask(defOp) ||
       !isMovablePureOp(defOp))
     return false;
   if (hoistSet.insert(defOp).second)
@@ -198,7 +194,7 @@ computeClusterPlan(SmallVector<Operation *> intervalOps, Value mask) {
       continue;
 
     if (moveSet.contains(op)) {
-      if (!isMaskedMemoryOp(op) && hasResultUseOutside(op, moveSet))
+      if (!getMaskedOpMask(op) && hasResultUseOutside(op, moveSet))
         return failure();
       continue;
     }
@@ -375,7 +371,7 @@ static bool runOnBlock(Block &block, IRRewriter &rewriter) {
     ops.push_back(&op);
 
   for (Operation *op : ops) {
-    if (op->getBlock() != &block || !isMaskedMemoryOp(op))
+    if (op->getBlock() != &block || !getMaskedOpMask(op))
       continue;
 
     FailureOr<ClusterPlan> cluster = findCluster(op);
