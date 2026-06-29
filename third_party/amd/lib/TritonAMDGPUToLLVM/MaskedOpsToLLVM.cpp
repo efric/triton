@@ -1,16 +1,19 @@
 #include "MaskedOpsToLLVM.h"
 
 #include "AsyncUtility.h"
+#include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TritonAMDGPUToLLVM/Passes.h"
 #include "Utility.h"
+#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
-#include "llvm/ADT/TypeSwitch.h"
+#include "triton/Tools/Sys/GetEnv.h"
 #include <tuple>
 
 using namespace mlir;
@@ -170,68 +173,6 @@ lowerMaskedRegionOp(triton::amdgpu::MaskedRegionOp regionOp,
   return success();
 }
 
-static void lowerMaskedLoadOp(triton::amdgpu::MaskedLoadOp loadOp,
-                              const AMD::TargetInfo &targetInfo,
-                              RewriterBase &rewriter) {
-  Location loc = loadOp.getLoc();
-  Value mask = loadOp.getMask();
-  Value falseVal = loadOp.getFalseVal();
-
-  rewriter.setInsertionPoint(loadOp);
-  if (mlir::matchPattern(mask, mlir::m_One())) {
-    Value loadResult =
-        AMD::createUnmaskedLoadFromMaskedOp(rewriter, loc, loadOp, targetInfo);
-    rewriter.replaceOp(loadOp, loadResult);
-    return;
-  }
-
-  Type elemTy = loadOp.getResult().getType();
-  Block *currentBlock = rewriter.getInsertionBlock();
-  Block *afterLoad =
-      rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
-  afterLoad->addArgument(elemTy, loc);
-
-  Block *trueBlock = rewriter.createBlock(afterLoad);
-
-  rewriter.setInsertionPointToEnd(currentBlock);
-  LLVM::CondBrOp::create(rewriter, loc, mask, trueBlock, ValueRange{},
-                         afterLoad, ValueRange{falseVal});
-
-  rewriter.setInsertionPointToStart(trueBlock);
-  Value loadResult =
-      AMD::createUnmaskedLoadFromMaskedOp(rewriter, loc, loadOp, targetInfo);
-  LLVM::BrOp::create(rewriter, loc, ValueRange{loadResult}, afterLoad);
-
-  rewriter.replaceOp(loadOp, afterLoad->getArgument(0));
-}
-
-static void lowerMaskedStoreOp(triton::amdgpu::MaskedStoreOp storeOp,
-                               RewriterBase &rewriter) {
-  Location loc = storeOp.getLoc();
-  Value mask = storeOp.getMask();
-
-  rewriter.setInsertionPoint(storeOp);
-  if (mlir::matchPattern(mask, mlir::m_One())) {
-    AMD::createUnmaskedStoreFromMaskedOp(rewriter, loc, storeOp);
-    rewriter.eraseOp(storeOp);
-    return;
-  }
-
-  Block *currentBlock = rewriter.getInsertionBlock();
-  Block *afterStore =
-      rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
-  Block *trueBlock = rewriter.createBlock(afterStore);
-
-  rewriter.setInsertionPointToEnd(currentBlock);
-  LLVM::CondBrOp::create(rewriter, loc, mask, trueBlock, afterStore);
-
-  rewriter.setInsertionPointToStart(trueBlock);
-  AMD::createUnmaskedStoreFromMaskedOp(rewriter, loc, storeOp);
-  LLVM::BrOp::create(rewriter, loc, afterStore);
-
-  rewriter.eraseOp(storeOp);
-}
-
 class ConvertMaskedRegionOp final
     : public OpRewritePattern<triton::amdgpu::MaskedRegionOp> {
 public:
@@ -251,7 +192,36 @@ public:
 
   LogicalResult matchAndRewrite(triton::amdgpu::MaskedLoadOp loadOp,
                                 PatternRewriter &rewriter) const override {
-    lowerMaskedLoadOp(loadOp, targetInfo, rewriter);
+    Location loc = loadOp.getLoc();
+    Value mask = loadOp.getMask();
+    Value falseVal = loadOp.getFalseVal();
+
+    rewriter.setInsertionPoint(loadOp);
+    if (mlir::matchPattern(mask, mlir::m_One())) {
+      Value loadResult =
+          AMD::createUnmaskedLoadFromMaskedOp(rewriter, loc, loadOp, targetInfo);
+      rewriter.replaceOp(loadOp, loadResult);
+      return success();
+    }
+
+    Type elemTy = loadOp.getResult().getType();
+    Block *currentBlock = rewriter.getInsertionBlock();
+    Block *afterLoad =
+        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+    afterLoad->addArgument(elemTy, loc);
+
+    Block *trueBlock = rewriter.createBlock(afterLoad);
+
+    rewriter.setInsertionPointToEnd(currentBlock);
+    LLVM::CondBrOp::create(rewriter, loc, mask, trueBlock, ValueRange{},
+                           afterLoad, ValueRange{falseVal});
+
+    rewriter.setInsertionPointToStart(trueBlock);
+    Value loadResult =
+        AMD::createUnmaskedLoadFromMaskedOp(rewriter, loc, loadOp, targetInfo);
+    LLVM::BrOp::create(rewriter, loc, ValueRange{loadResult}, afterLoad);
+
+    rewriter.replaceOp(loadOp, afterLoad->getArgument(0));
     return success();
   }
 
@@ -266,7 +236,29 @@ public:
 
   LogicalResult matchAndRewrite(triton::amdgpu::MaskedStoreOp storeOp,
                                 PatternRewriter &rewriter) const override {
-    lowerMaskedStoreOp(storeOp, rewriter);
+    Location loc = storeOp.getLoc();
+    Value mask = storeOp.getMask();
+
+    rewriter.setInsertionPoint(storeOp);
+    if (mlir::matchPattern(mask, mlir::m_One())) {
+      AMD::createUnmaskedStoreFromMaskedOp(rewriter, loc, storeOp);
+      rewriter.eraseOp(storeOp);
+      return success();
+    }
+
+    Block *currentBlock = rewriter.getInsertionBlock();
+    Block *afterStore =
+        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+    Block *trueBlock = rewriter.createBlock(afterStore);
+
+    rewriter.setInsertionPointToEnd(currentBlock);
+    LLVM::CondBrOp::create(rewriter, loc, mask, trueBlock, afterStore);
+
+    rewriter.setInsertionPointToStart(trueBlock);
+    AMD::createUnmaskedStoreFromMaskedOp(rewriter, loc, storeOp);
+    LLVM::BrOp::create(rewriter, loc, afterStore);
+
+    rewriter.eraseOp(storeOp);
     return success();
   }
 };
@@ -299,42 +291,20 @@ void populateMaskedOpsToLLVMPatterns(RewritePatternSet &patterns,
 
 LogicalResult lowerMaskedOpsToLLVM(ModuleOp module,
                                    const TargetInfo &targetInfo) {
-  IRRewriter rewriter(module.getContext());
+  RewritePatternSet patterns(module.getContext());
+  populateMaskedOpsToLLVMPatterns(patterns, targetInfo);
+  if (failed(applyPatternsGreedily(module, std::move(patterns))))
+    return failure();
 
-  while (true) {
-    Operation *nextOp = nullptr;
-    module.walk([&](Operation *op) {
-      if (isa<triton::amdgpu::MaskedRegionOp, triton::amdgpu::MaskedLoadOp,
-              triton::amdgpu::MaskedStoreOp>(op)) {
-        nextOp = op;
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-
-    if (!nextOp)
-      return success();
-
-    if (failed(llvm::TypeSwitch<Operation *, LogicalResult>(nextOp)
-                   .Case<triton::amdgpu::MaskedRegionOp>(
-                       [&](auto regionOp) -> LogicalResult {
-                         return lowerMaskedRegionOp(regionOp, rewriter);
-                       })
-                   .Case<triton::amdgpu::MaskedLoadOp>(
-                       [&](auto loadOp) -> LogicalResult {
-                         lowerMaskedLoadOp(loadOp, targetInfo, rewriter);
-                         return success();
-                       })
-                   .Case<triton::amdgpu::MaskedStoreOp>(
-                       [&](auto storeOp) -> LogicalResult {
-                         lowerMaskedStoreOp(storeOp, rewriter);
-                         return success();
-                       })
-                   .Default([](Operation *) -> LogicalResult {
-                     return failure();
-                   })))
-      return failure();
-  }
+  WalkResult remainingMaskedOps = module.walk([](Operation *op) {
+    if (isa<triton::amdgpu::MaskedRegionOp, triton::amdgpu::MaskedLoadOp,
+            triton::amdgpu::MaskedStoreOp>(op))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  if (remainingMaskedOps.wasInterrupted())
+    return failure();
+  return success();
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>
