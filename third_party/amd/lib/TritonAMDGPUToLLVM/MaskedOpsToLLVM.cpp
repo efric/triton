@@ -48,10 +48,11 @@ Value createRegularLoadFromMaskedOp(RewriterBase &rewriter, Location loc,
   return load;
 }
 
-Value createUnmaskedLoadFromMaskedOp(RewriterBase &rewriter, Location loc,
-                                     amdgpu::MaskedLoadOp loadOp,
-                                     const TargetInfo &targetInfo,
-                                     bool emitFallbackRemark) {
+static Value
+createUnmaskedLoadFromMaskedOp(RewriterBase &rewriter, Location loc,
+                               amdgpu::MaskedLoadOp loadOp,
+                               const TargetInfo &targetInfo,
+                               bool emitFallbackRemark = true) {
   Value multicastMask = loadOp.getMulticastMask();
   if (!multicastMask)
     return createRegularLoadFromMaskedOp(rewriter, loc, loadOp);

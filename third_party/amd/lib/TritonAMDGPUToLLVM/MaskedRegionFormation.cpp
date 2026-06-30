@@ -371,7 +371,7 @@ static bool runOnBlock(Block &block, IRRewriter &rewriter) {
     ops.push_back(&op);
 
   for (Operation *op : ops) {
-    if (op->getBlock() != &block || !getMaskedOpMask(op))
+    if (!getMaskedOpMask(op))
       continue;
 
     FailureOr<ClusterPlan> cluster = findCluster(op);

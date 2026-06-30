@@ -194,9 +194,6 @@ LogicalResult MaskedRegionOp::verify() {
   if (!yield)
     return emitOpError("body must terminate with `amdg.masked_yield`");
 
-  if (!llvm::equal(yield.getValues().getTypes(), getResultTypes()))
-    return yield.emitOpError("operand types must match parent result types");
-
   for (Operation &op : block) {
     if (failed(verifyMaskedRegionBodyOp(&op)))
       return failure();

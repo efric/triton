@@ -17,11 +17,6 @@ LogicalResult lowerMaskedOpsToLLVM(ModuleOp module,
 Value createRegularLoadFromMaskedOp(RewriterBase &rewriter, Location loc,
                                     amdgpu::MaskedLoadOp loadOp);
 
-Value createUnmaskedLoadFromMaskedOp(RewriterBase &rewriter, Location loc,
-                                     amdgpu::MaskedLoadOp loadOp,
-                                     const TargetInfo &targetInfo,
-                                     bool emitFallbackRemark = true);
-
 LLVM::StoreOp createUnmaskedStoreFromMaskedOp(RewriterBase &rewriter,
                                               Location loc,
                                               amdgpu::MaskedStoreOp storeOp);
