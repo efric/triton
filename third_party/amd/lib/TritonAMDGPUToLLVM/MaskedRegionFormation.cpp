@@ -120,14 +120,14 @@ appendHoistDependency(Value value,
   return true;
 }
 
-struct ClusterPlan {
+struct MaskedRegionPlan {
   SmallVector<Operation *> intervalOps;
   SmallVector<Operation *> opsToMove;
   SmallVector<Operation *> opsToHoist;
 };
 
-static FailureOr<ClusterPlan>
-computeClusterPlan(SmallVector<Operation *> intervalOps, Value mask) {
+static FailureOr<MaskedRegionPlan>
+computeMaskedRegionPlan(SmallVector<Operation *> intervalOps, Value mask) {
   llvm::SmallPtrSet<Operation *, 16> intervalSet(intervalOps.begin(),
                                                  intervalOps.end());
   Value canonicalMask = resolveAggregateMask(mask);
@@ -244,11 +244,11 @@ computeClusterPlan(SmallVector<Operation *> intervalOps, Value mask) {
     }
   }
 
-  return ClusterPlan{std::move(intervalOps), std::move(opsToMove),
-                     std::move(opsToHoist)};
+  return MaskedRegionPlan{std::move(intervalOps), std::move(opsToMove),
+                          std::move(opsToHoist)};
 }
 
-static FailureOr<ClusterPlan> findCluster(Operation *first) {
+static FailureOr<MaskedRegionPlan> findMaskedRegion(Operation *first) {
   Value mask = getMaskedOpMask(first);
   if (!mask)
     return failure();
@@ -283,10 +283,11 @@ static FailureOr<ClusterPlan> findCluster(Operation *first) {
       break;
   }
 
-  return computeClusterPlan(std::move(intervalOps), mask);
+  return computeMaskedRegionPlan(std::move(intervalOps), mask);
 }
 
-static void formMaskedRegion(const ClusterPlan &plan, IRRewriter &rewriter) {
+static void formMaskedRegion(const MaskedRegionPlan &plan,
+                             IRRewriter &rewriter) {
   Operation *first = plan.intervalOps.front();
   Location loc = first->getLoc();
   Value mask = getMaskedOpMask(first);
@@ -374,11 +375,11 @@ static bool runOnBlock(Block &block, IRRewriter &rewriter) {
     if (!getMaskedOpMask(op))
       continue;
 
-    FailureOr<ClusterPlan> cluster = findCluster(op);
-    if (failed(cluster))
+    FailureOr<MaskedRegionPlan> maskedRegion = findMaskedRegion(op);
+    if (failed(maskedRegion))
       continue;
 
-    formMaskedRegion(*cluster, rewriter);
+    formMaskedRegion(*maskedRegion, rewriter);
     return true;
   }
 

@@ -48,52 +48,6 @@ Value createRegularLoadFromMaskedOp(RewriterBase &rewriter, Location loc,
   return load;
 }
 
-static Value
-createUnmaskedLoadFromMaskedOp(RewriterBase &rewriter, Location loc,
-                               amdgpu::MaskedLoadOp loadOp,
-                               const TargetInfo &targetInfo,
-                               bool emitFallbackRemark = true) {
-  Value multicastMask = loadOp.getMulticastMask();
-  if (!multicastMask)
-    return createRegularLoadFromMaskedOp(rewriter, loc, loadOp);
-
-  TritonLLVMOpBuilder b(loc, rewriter);
-  Type elemTy = loadOp.getResult().getType();
-  Value ptr = loadOp.getPtr();
-  triton::CacheModifier cacheMod = loadOp.getCache();
-
-  int vecBits = 0;
-  if (auto vecTy = dyn_cast<VectorType>(elemTy)) {
-    vecBits = vecTy.getNumElements() * vecTy.getElementTypeBitWidth();
-  } else {
-    vecBits = elemTy.getIntOrFloatBitWidth();
-  }
-  assert(vecBits != 0);
-
-  // We can only multicast for 32, 64, 128 bit load size (hw limitation).
-  if (targetInfo.supportsClusterLoadBitWidth(vecBits)) {
-    std::string intrinsic =
-        "llvm.amdgcn.cluster.load.b" + std::to_string(vecBits);
-    auto cacheModBits = LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
-        cacheMod, true, targetInfo);
-    // The intrinsics only work with int32 or vec of int32 for >32bit.
-    Type resTy = i32_ty;
-    if (vecBits > 32)
-      resTy = vec_ty(i32_ty, vecBits / 32);
-    auto clusterLoadOp = LLVM::createLLVMIntrinsicCallOp(
-        rewriter, loc, intrinsic, {resTy},
-        {ptr, b.i32_val(cacheModBits), multicastMask});
-    return b.bitcast(clusterLoadOp->getResult(0), elemTy);
-  }
-
-  if (emitFallbackRemark) {
-    loadOp.emitRemark()
-        << "Multicast with bit width " << vecBits << " is not supported on "
-        << targetInfo.getArch() << " falling back to regular load";
-  }
-  return createRegularLoadFromMaskedOp(rewriter, loc, loadOp);
-}
-
 LLVM::StoreOp createUnmaskedStoreFromMaskedOp(RewriterBase &rewriter,
                                               Location loc,
                                               amdgpu::MaskedStoreOp storeOp) {
@@ -128,52 +82,6 @@ LLVM::StoreOp createUnmaskedStoreFromMaskedOp(RewriterBase &rewriter,
 
 namespace {
 
-static LogicalResult
-lowerMaskedRegionOp(triton::amdgpu::MaskedRegionOp regionOp,
-                    RewriterBase &rewriter) {
-  Location loc = regionOp.getLoc();
-  Region &region = regionOp.getBody();
-  if (!region.hasOneBlock())
-    return regionOp.emitOpError("expected one body block");
-
-  Block *body = &region.front();
-  auto yield = dyn_cast<triton::amdgpu::MaskedYieldOp>(body->getTerminator());
-  if (!yield)
-    return regionOp.emitOpError("expected `amdg.masked_yield` terminator");
-
-  rewriter.setInsertionPoint(regionOp);
-  if (mlir::matchPattern(regionOp.getMask(), mlir::m_One())) {
-    ValueRange results = yield.getValues();
-    rewriter.inlineBlockBefore(body, regionOp, {});
-    rewriter.replaceOp(regionOp, results);
-    rewriter.eraseOp(yield);
-    return success();
-  }
-
-  Block *currentBlock = rewriter.getInsertionBlock();
-  Block *afterRegion =
-      rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
-  auto joinArgs = afterRegion->addArguments(
-      regionOp.getResultTypes(),
-      SmallVector<Location>(regionOp.getNumResults(), loc));
-  SmallVector<Value> replacementValues(joinArgs.begin(), joinArgs.end());
-
-  Block *trueBlock = rewriter.createBlock(afterRegion);
-
-  rewriter.setInsertionPointToEnd(currentBlock);
-  LLVM::CondBrOp::create(rewriter, loc, regionOp.getMask(), trueBlock,
-                         ValueRange{}, afterRegion, regionOp.getFalseValues());
-
-  rewriter.inlineBlockBefore(body, trueBlock, trueBlock->end(), {});
-
-  rewriter.setInsertionPoint(yield);
-  LLVM::BrOp::create(rewriter, loc, yield.getValues(), afterRegion);
-  rewriter.eraseOp(yield);
-
-  rewriter.replaceOp(regionOp, replacementValues);
-  return success();
-}
-
 class ConvertMaskedRegionOp final
     : public OpRewritePattern<triton::amdgpu::MaskedRegionOp> {
 public:
@@ -181,7 +89,49 @@ public:
 
   LogicalResult matchAndRewrite(triton::amdgpu::MaskedRegionOp regionOp,
                                 PatternRewriter &rewriter) const override {
-    return lowerMaskedRegionOp(regionOp, rewriter);
+    Location loc = regionOp.getLoc();
+    Region &region = regionOp.getBody();
+    if (!region.hasOneBlock())
+      return regionOp.emitOpError("expected one body block");
+
+    Block *body = &region.front();
+    auto yield =
+        dyn_cast<triton::amdgpu::MaskedYieldOp>(body->getTerminator());
+    if (!yield)
+      return regionOp.emitOpError("expected `amdg.masked_yield` terminator");
+
+    rewriter.setInsertionPoint(regionOp);
+    if (mlir::matchPattern(regionOp.getMask(), mlir::m_One())) {
+      ValueRange results = yield.getValues();
+      rewriter.inlineBlockBefore(body, regionOp, {});
+      rewriter.replaceOp(regionOp, results);
+      rewriter.eraseOp(yield);
+      return success();
+    }
+
+    Block *currentBlock = rewriter.getInsertionBlock();
+    Block *afterRegion =
+        rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
+    auto joinArgs = afterRegion->addArguments(
+        regionOp.getResultTypes(),
+        SmallVector<Location>(regionOp.getNumResults(), loc));
+    SmallVector<Value> replacementValues(joinArgs.begin(), joinArgs.end());
+
+    Block *trueBlock = rewriter.createBlock(afterRegion);
+
+    rewriter.setInsertionPointToEnd(currentBlock);
+    LLVM::CondBrOp::create(rewriter, loc, regionOp.getMask(), trueBlock,
+                           ValueRange{}, afterRegion,
+                           regionOp.getFalseValues());
+
+    rewriter.inlineBlockBefore(body, trueBlock, trueBlock->end(), {});
+
+    rewriter.setInsertionPoint(yield);
+    LLVM::BrOp::create(rewriter, loc, yield.getValues(), afterRegion);
+    rewriter.eraseOp(yield);
+
+    rewriter.replaceOp(regionOp, replacementValues);
+    return success();
   }
 };
 
@@ -194,18 +144,55 @@ public:
   LogicalResult matchAndRewrite(triton::amdgpu::MaskedLoadOp loadOp,
                                 PatternRewriter &rewriter) const override {
     Location loc = loadOp.getLoc();
+    Type elemTy = loadOp.getResult().getType();
     Value mask = loadOp.getMask();
     Value falseVal = loadOp.getFalseVal();
+    Value multicastMask = loadOp.getMulticastMask();
+    Value ptr = loadOp.getPtr();
+    triton::CacheModifier cacheMod = loadOp.getCache();
+
+    auto createLoad = [&](Location loadLoc) -> Value {
+      if (!multicastMask)
+        return AMD::createRegularLoadFromMaskedOp(rewriter, loadLoc, loadOp);
+
+      int vecBits = 0;
+      if (auto vecTy = dyn_cast<VectorType>(elemTy)) {
+        vecBits = vecTy.getNumElements() * vecTy.getElementTypeBitWidth();
+      } else {
+        vecBits = elemTy.getIntOrFloatBitWidth();
+      }
+      assert(vecBits != 0);
+
+      // We can only multicast for 32, 64, 128 bit load size (hw limitation).
+      if (targetInfo.supportsClusterLoadBitWidth(vecBits)) {
+        std::string intrinsic =
+            "llvm.amdgcn.cluster.load.b" + std::to_string(vecBits);
+        auto cacheModBits = LLVM::AMD::getCtrlBitsForCacheModifierOnTarget(
+            cacheMod, true, targetInfo);
+        // The intrinsics only work with int32 or vec of int32 for >32bit.
+        Type resTy = i32_ty;
+        if (vecBits > 32)
+          resTy = vec_ty(i32_ty, vecBits / 32);
+        TritonLLVMOpBuilder b(loadLoc, rewriter);
+        auto clusterLoadOp = LLVM::createLLVMIntrinsicCallOp(
+            rewriter, loadLoc, intrinsic, {resTy},
+            {ptr, b.i32_val(cacheModBits), multicastMask});
+        return b.bitcast(clusterLoadOp->getResult(0), elemTy);
+      }
+
+      loadOp.emitRemark()
+          << "Multicast with bit width " << vecBits << " is not supported on "
+          << targetInfo.getArch() << " falling back to regular load";
+      return AMD::createRegularLoadFromMaskedOp(rewriter, loadLoc, loadOp);
+    };
 
     rewriter.setInsertionPoint(loadOp);
     if (mlir::matchPattern(mask, mlir::m_One())) {
-      Value loadResult =
-          AMD::createUnmaskedLoadFromMaskedOp(rewriter, loc, loadOp, targetInfo);
+      Value loadResult = createLoad(loc);
       rewriter.replaceOp(loadOp, loadResult);
       return success();
     }
 
-    Type elemTy = loadOp.getResult().getType();
     Block *currentBlock = rewriter.getInsertionBlock();
     Block *afterLoad =
         rewriter.splitBlock(currentBlock, rewriter.getInsertionPoint());
@@ -218,8 +205,7 @@ public:
                            afterLoad, ValueRange{falseVal});
 
     rewriter.setInsertionPointToStart(trueBlock);
-    Value loadResult =
-        AMD::createUnmaskedLoadFromMaskedOp(rewriter, loc, loadOp, targetInfo);
+    Value loadResult = createLoad(loc);
     LLVM::BrOp::create(rewriter, loc, ValueRange{loadResult}, afterLoad);
 
     rewriter.replaceOp(loadOp, afterLoad->getArgument(0));
