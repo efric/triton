@@ -80,6 +80,7 @@ public:
   bool supportsClusterLoadBitWidth(int bitWidth) const;
 
   bool supportsBufferAtomicRMW() const;
+  bool supportsCooperativeAtomics() const;
   bool supportsBufferAtomicFadd(Type elementType) const;
   bool supportsBufferAtomicFMinMax(Type elementType) const;
   int32_t getBufferAtomicCachePolicy(bool hasUsers) const;

@@ -257,6 +257,64 @@ def CondBarrierOp : TT_AMDGPU_Op<"cond_barrier"> {
 }
 
 //===----------------------------------------------------------------------===//
+// Cooperative atomic memory operations
+//===----------------------------------------------------------------------===//
+
+def CooperativeAtomicLoadOp : TT_AMDGPU_Op<"cooperative_atomic_load", [
+  AtomicOpInterface,
+  SameLoadStoreOperandsAndResultEncoding,
+  TypesMatchWith<"result matches ptr type", "ptr", "result", "getPointeeType($_self)">
+]> {
+  let summary = "Cooperatively load naturally aligned 128-byte global regions";
+  let description = [{
+    Each naturally aligned group of 32, 16, or 8 lanes in a wave32 accesses
+    4, 8, or 16 bytes per lane, respectively, as a single 128-byte atomic region.
+    The pointer layout must assign consecutive elements to each lane's fixed
+    access and complete regions to consecutive participating lanes. All lanes
+    participate. Pointers must designate contiguous, naturally aligned global
+    storage on a fabric supporting cooperative atomic accesses.
+
+    `ordering` uses the C ABI memory-order encoding: 0 (relaxed), 2 (acquire),
+    or 5 (sequentially consistent). `scope` is an AMD LLVM synchronization scope;
+    the empty string denotes system scope. This operation may synchronize only
+    with cooperative atomics of the same total access size.
+  }];
+  let arguments = (ins
+    Arg<TT_PtrTensor, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$ptr,
+    I32Attr:$bytesPerLane,
+    I32Attr:$ordering,
+    StrAttr:$scope
+  );
+  let results = (outs TT_FpIntTensor:$result);
+  let assemblyFormat = "$ptr attr-dict `:` type($ptr) `->` type($result)";
+  let extraClassDeclaration = [{ ::mlir::triton::MemSemantic getSem(); }];
+  let hasVerifier = 1;
+}
+
+def CooperativeAtomicStoreOp : TT_AMDGPU_Op<"cooperative_atomic_store", [
+  AtomicOpInterface,
+  SameLoadStoreOperandsEncoding,
+  TypesMatchWith<"value matches ptr type", "ptr", "value", "getPointeeType($_self)">
+]> {
+  let summary = "Cooperatively store naturally aligned 128-byte global regions";
+  let description = [{
+    The participation, layout and address requirements match
+    `amdg.cooperative_atomic_load`. `ordering` is 0 (relaxed), 3 (release), or
+    5 (sequentially consistent), using the C ABI memory-order encoding.
+  }];
+  let arguments = (ins
+    Arg<TT_PtrTensor, "", [MemWrite<GlobalMemory>]>:$ptr,
+    TT_FpIntTensor:$value,
+    I32Attr:$bytesPerLane,
+    I32Attr:$ordering,
+    StrAttr:$scope
+  );
+  let assemblyFormat = "$ptr `,` $value attr-dict `:` type($ptr) `,` type($value)";
+  let extraClassDeclaration = [{ ::mlir::triton::MemSemantic getSem(); }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // BufferLoadOp
 //===----------------------------------------------------------------------===//
 

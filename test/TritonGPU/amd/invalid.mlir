@@ -1,5 +1,28 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @cooperative_atomic_interleaved_chunks(%ptr: tensor<256x!tt.ptr<i32>, #blocked>) {
+    // Each lane owns two 16-byte chunks, interleaved across the intended packet.
+    // expected-error @below {{layout must map 4 consecutive elements per lane and 8 consecutive lanes to each 128-byte region}}
+    %value = amdg.cooperative_atomic_load %ptr {bytesPerLane = 16 : i32, ordering = 0 : i32, scope = ""} : tensor<256x!tt.ptr<i32>, #blocked> -> tensor<256xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @cooperative_atomic_extra_physical_warps(%ptr: tensor<128x!tt.ptr<i32>, #blocked>) {
+    // expected-error @below {{layout warp and CTA counts must match the execution context}}
+    %value = amdg.cooperative_atomic_load %ptr {bytesPerLane = 16 : i32, ordering = 0 : i32, scope = ""} : tensor<128x!tt.ptr<i32>, #blocked> -> tensor<128xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
 // expected-error @+1 {{WMMA version must be in the [1, 3] range}}
 #wmma = #ttg.amd_wmma<{version = 0, isTranspose = false, ctaLayout = {warp = [[0, 1], [1, 0]]}}>
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {

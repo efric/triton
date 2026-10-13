@@ -1,5 +1,91 @@
 // RUN:  triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch="gfx1250" | FileCheck %s --check-prefix=GFX1250
 // RUN:  triton-opt %s -split-input-file --allocate-shared-memory --convert-triton-amdgpu-to-llvm=gfx-arch="gfx1250-strict" | FileCheck %s --check-prefix=STRICT
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: llvm.func @cooperative_atomic_i32
+  tt.func @cooperative_atomic_i32(%src: tensor<32x!tt.ptr<i32>, #blocked>, %dst: tensor<32x!tt.ptr<i32>, #blocked>) {
+    // GFX1250: %[[SCOPE:.*]] = llvm.mlir.metadata_as_value #llvm.md_node<#llvm.md_string<"agent-one-as">>
+    // GFX1250: %[[ORDER:.*]] = llvm.mlir.constant(2 : i32)
+    // GFX1250: llvm.call_intrinsic "llvm.amdgcn.cooperative.atomic.load.32x4B"({{.*}}, %[[ORDER]], %[[SCOPE]]) : (!llvm.ptr<1>, i32, !llvm.metadata) -> i32
+    %value = amdg.cooperative_atomic_load %src {bytesPerLane = 4 : i32, ordering = 2 : i32, scope = "agent-one-as"} : tensor<32x!tt.ptr<i32>, #blocked> -> tensor<32xi32, #blocked>
+    // GFX1250: llvm.call_intrinsic "llvm.amdgcn.cooperative.atomic.store.32x4B"({{.*}}) : (!llvm.ptr<1>, i32, i32, !llvm.metadata) -> ()
+    amdg.cooperative_atomic_store %dst, %value {bytesPerLane = 4 : i32, ordering = 3 : i32, scope = "agent-one-as"} : tensor<32x!tt.ptr<i32>, #blocked>, tensor<32xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: llvm.func @cooperative_atomic_i64
+  tt.func @cooperative_atomic_i64(%src: tensor<32x!tt.ptr<i64>, #blocked>, %dst: tensor<32x!tt.ptr<i64>, #blocked>) {
+    // GFX1250: %[[VALUE:.*]] = llvm.call_intrinsic "llvm.amdgcn.cooperative.atomic.load.16x8B"({{.*}}) : (!llvm.ptr<1>, i32, !llvm.metadata) -> vector<2xi32>
+    // GFX1250: llvm.bitcast %[[VALUE]] : vector<2xi32> to i64
+    %value = amdg.cooperative_atomic_load %src {bytesPerLane = 8 : i32, ordering = 0 : i32, scope = "workgroup"} : tensor<32x!tt.ptr<i64>, #blocked> -> tensor<32xi64, #blocked>
+    // GFX1250: llvm.call_intrinsic "llvm.amdgcn.cooperative.atomic.store.16x8B"({{.*}}) : (!llvm.ptr<1>, vector<2xi32>, i32, !llvm.metadata) -> ()
+    amdg.cooperative_atomic_store %dst, %value {bytesPerLane = 8 : i32, ordering = 0 : i32, scope = "workgroup"} : tensor<32x!tt.ptr<i64>, #blocked>, tensor<32xi64, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [1, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: llvm.func @cooperative_atomic_bf16_packets
+  tt.func @cooperative_atomic_bf16_packets(%src: tensor<4x64x!tt.ptr<bf16>, #blocked>, %dst: tensor<4x64x!tt.ptr<bf16>, #blocked>) {
+    // GFX1250: llvm.mlir.metadata_as_value #llvm.md_node<#llvm.md_string<"">>
+    // GFX1250: %[[VALUE:.*]] = llvm.call_intrinsic "llvm.amdgcn.cooperative.atomic.load.8x16B"({{.*}}) : (!llvm.ptr<1>, i32, !llvm.metadata) -> vector<4xi32>
+    // GFX1250: llvm.bitcast %[[VALUE]] : vector<4xi32> to vector<8xbf16>
+    %value = amdg.cooperative_atomic_load %src {bytesPerLane = 16 : i32, ordering = 5 : i32, scope = ""} : tensor<4x64x!tt.ptr<bf16>, #blocked> -> tensor<4x64xbf16, #blocked>
+    // GFX1250: llvm.call_intrinsic "llvm.amdgcn.cooperative.atomic.store.8x16B"({{.*}}) : (!llvm.ptr<1>, vector<4xi32>, i32, !llvm.metadata) -> ()
+    amdg.cooperative_atomic_store %dst, %value {bytesPerLane = 16 : i32, ordering = 5 : i32, scope = ""} : tensor<4x64x!tt.ptr<bf16>, #blocked>, tensor<4x64xbf16, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#linear = #ttg.linear<{register = [[1], [2]], lane = [[4], [8], [16], [32], [64]], warp = [], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: llvm.func @cooperative_atomic_linear_packets
+  tt.func @cooperative_atomic_linear_packets(%src: tensor<128x!tt.ptr<i32>, #linear>) {
+    // The load remains observable even when only the synchronization is used.
+    // GFX1250: llvm.call_intrinsic "llvm.amdgcn.cooperative.atomic.load.8x16B"
+    %value = amdg.cooperative_atomic_load %src {bytesPerLane = 16 : i32, ordering = 0 : i32, scope = ""} : tensor<128x!tt.ptr<i32>, #linear> -> tensor<128xi32, #linear>
+    tt.return
+  }
+}
+
+// -----
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 2], warpsPerCTA = [1, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: llvm.func @cooperative_atomic_packet_across_axes
+  tt.func @cooperative_atomic_packet_across_axes(%src: tensor<16x8x!tt.ptr<i32>, #blocked>) {
+    // One packet spans four rows of the logical tensor.
+    // GFX1250: llvm.call_intrinsic "llvm.amdgcn.cooperative.atomic.load.8x16B"
+    %value = amdg.cooperative_atomic_load %src {bytesPerLane = 16 : i32, ordering = 0 : i32, scope = ""} : tensor<16x8x!tt.ptr<i32>, #blocked> -> tensor<16x8xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#generic = #ttg.generic_linear<{register = [[1], [2]], lane = [[4], [8], [16], [32], [64]], warp = [[128], [384]], block = []}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: llvm.func @cooperative_atomic_swizzled_warps
+  tt.func @cooperative_atomic_swizzled_warps(%src: tensor<512x!tt.ptr<i32>, #generic>) {
+    // Warp order can change while complete packets remain intact.
+    // GFX1250: llvm.call_intrinsic "llvm.amdgcn.cooperative.atomic.load.8x16B"
+    %value = amdg.cooperative_atomic_load %src {bytesPerLane = 16 : i32, ordering = 0 : i32, scope = ""} : tensor<512x!tt.ptr<i32>, #generic> -> tensor<512xi32, #generic>
+    tt.return
+  }
+}
+
+// -----
+
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 4]], warp = [[16, 0]], block = []}>
 #mma = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[1, 0]]}, isTranspose = true, instrShape = [16, 16, 32]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 32 : i32} {

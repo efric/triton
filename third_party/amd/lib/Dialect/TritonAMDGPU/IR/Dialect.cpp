@@ -1177,6 +1177,121 @@ LogicalResult BufferLoadToLocalOp::verify() {
   return emitError() << "BufferLoadToLocal unsupported on target architecture";
 }
 
+static LogicalResult verifyCooperativeAtomic(Operation *op,
+                                             RankedTensorType pointerType,
+                                             int bytesPerLane, int ordering,
+                                             StringRef scope, bool isStore) {
+  if (bytesPerLane != 4 && bytesPerLane != 8 && bytesPerLane != 16)
+    return op->emitOpError("bytesPerLane must be 4, 8, or 16");
+  if (ordering != 0 && ordering != 5 && ordering != (isStore ? 3 : 2))
+    return op->emitOpError("unsupported C ABI atomic ordering");
+  constexpr StringLiteral scopes[] = {"",
+                                      "agent",
+                                      "workgroup",
+                                      "cluster",
+                                      "wavefront",
+                                      "one-as",
+                                      "agent-one-as",
+                                      "workgroup-one-as",
+                                      "cluster-one-as",
+                                      "wavefront-one-as"};
+  if (!llvm::is_contained(scopes, scope))
+    return op->emitOpError(
+        "unsupported cooperative atomic synchronization scope");
+
+  auto pointer = cast<triton::PointerType>(pointerType.getElementType());
+  if (pointer.getAddressSpace() != triton::PtrAddrSpace::Global)
+    return op->emitOpError("requires global memory pointers");
+  Type elementType = pointer.getPointeeType();
+  if (!elementType.isIntOrFloat())
+    return op->emitOpError("requires numeric elements");
+  unsigned elementBits = elementType.getIntOrFloatBitWidth();
+  if ((elementBits != 8 && elementBits != 16 && elementBits != 32 &&
+       elementBits != 64) ||
+      elementBits > bytesPerLane * 8)
+    return op->emitOpError(
+        "element width must divide the per-lane access size");
+
+  auto module = op->getParentOfType<ModuleOp>();
+  if (!module)
+    return op->emitOpError("requires a module execution context");
+  {
+    if (auto target = module->getAttrOfType<StringAttr>(gpu::AttrTargetName)) {
+      if (!target.getValue().starts_with("hip:") ||
+          !TargetFeatures::fromModuleOp(module).supportsCooperativeAtomics())
+        return op->emitOpError("requires a GFX12.5 target");
+    }
+    if (auto threads =
+            module->getAttrOfType<IntegerAttr>("ttg.threads-per-warp"))
+      if (threads.getInt() != 32)
+        return op->emitOpError("requires wave32");
+  }
+
+  if (!isa_and_nonnull<gpu::DistributedEncodingTrait>(
+          pointerType.getEncoding()))
+    return op->emitOpError("requires an explicit distributed layout");
+  auto encoding = dyn_cast<gpu::LayoutEncodingTrait>(pointerType.getEncoding());
+  if (!encoding || encoding.getRank() != pointerType.getRank())
+    return op->emitOpError("layout rank must match the pointer tensor rank");
+  if (llvm::any_of(pointerType.getShape(),
+                   [](int64_t size) { return !llvm::isPowerOf2_64(size); }))
+    return op->emitOpError("tensor dimensions must be positive powers of two");
+  LinearLayout layout = gpu::toLinearLayout(pointerType);
+  auto kRegister = StringAttr::get(op->getContext(), "register");
+  auto kLane = StringAttr::get(op->getContext(), "lane");
+  auto kWarp = StringAttr::get(op->getContext(), "warp");
+  auto kBlock = StringAttr::get(op->getContext(), "block");
+  if (layout.getInDimSize(kLane) != 32)
+    return op->emitOpError("requires a wave32 layout");
+  auto numWarps = gpu::maybeLookupNumWarps(op);
+  if (!numWarps || layout.getInDimSize(kWarp) != *numWarps ||
+      layout.getInDimSize(kBlock) != gpu::lookupNumCTAs(op))
+    return op->emitOpError(
+        "layout warp and CTA counts must match the execution context");
+  if (!layout.isInjective())
+    return op->emitOpError("does not support replicated tensor elements");
+
+  auto order = gpu::getOrderForMemory(pointerType);
+  auto dimensions =
+      triton::standardOutDimNames(op->getContext(), pointerType.getRank());
+  LinearLayout flat =
+      layout.transposeOuts(triton::applyPermutation(dimensions, order))
+          .flattenOuts();
+  auto out = *flat.getOutDimNames().begin();
+  unsigned elementsPerLane = bytesPerLane * 8 / elementBits;
+  LinearLayout packet =
+      LinearLayout::identity1D(elementsPerLane, kRegister, out) *
+      LinearLayout::identity1D(128 / bytesPerLane, kLane, out);
+  if (!divideLeft(flat, packet))
+    return op->emitOpError()
+           << "layout must map " << elementsPerLane
+           << " consecutive elements per lane and " << 128 / bytesPerLane
+           << " consecutive lanes to each 128-byte region";
+  return success();
+}
+
+LogicalResult CooperativeAtomicLoadOp::verify() {
+  return verifyCooperativeAtomic(getOperation(), getPtr().getType(),
+                                 getBytesPerLane(), getOrdering(), getScope(),
+                                 false);
+}
+
+LogicalResult CooperativeAtomicStoreOp::verify() {
+  return verifyCooperativeAtomic(getOperation(), getPtr().getType(),
+                                 getBytesPerLane(), getOrdering(), getScope(),
+                                 true);
+}
+
+triton::MemSemantic CooperativeAtomicLoadOp::getSem() {
+  return getOrdering() == 0 ? triton::MemSemantic::RELAXED
+                            : triton::MemSemantic::ACQUIRE;
+}
+
+triton::MemSemantic CooperativeAtomicStoreOp::getSem() {
+  return getOrdering() == 0 ? triton::MemSemantic::RELAXED
+                            : triton::MemSemantic::RELEASE;
+}
+
 // A buffer write's scalar base must be global memory (address space 1).
 static LogicalResult verifyBufferWriteBase(Operation *op, Value ptr) {
   if (triton::getAddressSpace(ptr.getType()) != triton::PtrAddrSpace::Global)

@@ -1216,6 +1216,20 @@ void init_gluon_ir(py::module_ &m) {
              return self.create<ttg::WarpSpecializeOp>(resultTypes,
                                                        partitionNumWarps);
            })
+      .def("create_cooperative_atomic_load",
+           [](GluonOpBuilder &self, Type resultType, Value ptr,
+              int32_t bytesPerLane, int32_t ordering,
+              const std::string &scope) -> Value {
+             return self.create<ttag::CooperativeAtomicLoadOp>(
+                 resultType, ptr, bytesPerLane, ordering, scope);
+           })
+      .def("create_cooperative_atomic_store",
+           [](GluonOpBuilder &self, Value ptr, Value value,
+              int32_t bytesPerLane, int32_t ordering,
+              const std::string &scope) {
+             self.create<ttag::CooperativeAtomicStoreOp>(
+                 ptr, value, bytesPerLane, ordering, scope);
+           })
       .def("create_buffer_load",
            [](GluonOpBuilder &self, Type resultType, Value ptr, Value offsets,
               Value mask, Value other,

@@ -73,6 +73,70 @@ HIP_TARGET_CDNA3 = GPUTarget("hip", "gfx942", 64)
 HIP_TARGET_CDNA4 = GPUTarget("hip", "gfx950", 64)
 HIP_TARGET_CDNA5 = GPUTarget("hip", "gfx1250", 32)
 
+
+@pytest.mark.parametrize("bytes_per_lane,dtype,load_sem,store_sem,scope,llvm_scope", [
+    (4, "i32", "relaxed", "relaxed", "gpu", "agent"),
+    (8, "i64", "acquire", "release", "cta", "workgroup"),
+    (16, "bf16", "seq_cst", "seq_cst", "sys", ""),
+])
+def test_cooperative_atomic_access(bytes_per_lane, dtype, load_sem, store_sem, scope, llvm_scope):
+    import triton
+
+    @gluon.jit
+    def kernel(src, dst, N: ttgl.constexpr, LAYOUT: ttgl.constexpr, BYTES: ttgl.constexpr, LOAD_SEM: ttgl.constexpr,
+               STORE_SEM: ttgl.constexpr, SCOPE: ttgl.constexpr):
+        offsets = ttgl.arange(0, N, layout=LAYOUT)
+        value = ttgl.amd.cdna5.cooperative_atomic_load(src + offsets, bytes_per_lane=BYTES, sem=LOAD_SEM, scope=SCOPE)
+        ttgl.amd.cdna5.cooperative_atomic_store(dst + offsets, value, bytes_per_lane=BYTES, sem=STORE_SEM, scope=SCOPE)
+
+    elements_per_lane = bytes_per_lane * 8 // tl.str_to_ty(dtype, None).primitive_bitwidth
+    source = gluon.GluonASTSource(kernel, {"src": f"*{dtype}", "dst": f"*{dtype}"}, {
+        "N": 32 * elements_per_lane,
+        "LAYOUT": ttgl.BlockedLayout([elements_per_lane], [32], [1], [0]),
+        "BYTES": bytes_per_lane,
+        "LOAD_SEM": load_sem,
+        "STORE_SEM": store_sem,
+        "SCOPE": scope,
+    })
+    compiled = triton.compile(source, target=HIP_TARGET_CDNA5, options={"num_warps": 1})
+    suffix = f"{128 // bytes_per_lane}x{bytes_per_lane}B.p1"
+    assert f"llvm.amdgcn.cooperative.atomic.load.{suffix}" in compiled.asm["llir"]
+    assert f"llvm.amdgcn.cooperative.atomic.store.{suffix}" in compiled.asm["llir"]
+    assert f'!{{!"{llvm_scope}"}}' in compiled.asm["llir"]
+    assert f"global_load_b{bytes_per_lane * 8}" in compiled.asm["amdgcn"]
+    assert f"global_store_b{bytes_per_lane * 8}" in compiled.asm["amdgcn"]
+    assert compiled.asm["hsaco"]
+
+
+def test_cooperative_atomic_load_polling():
+    import triton
+
+    @gluon.jit
+    def kernel(inbox, output, epoch):
+        layout: ttgl.constexpr = ttgl.BlockedLayout([4], [32], [1], [0])
+        words = ttgl.arange(0, 128, layout=layout)
+        packet = ttgl.amd.cdna5.cooperative_atomic_load(inbox + words, bytes_per_lane=16, scope="sys")
+        while ttgl.sum(((words % 32 == 31) & (packet != epoch)).to(ttgl.int32), 0) != 0:
+            packet = ttgl.amd.cdna5.cooperative_atomic_load(inbox + words, bytes_per_lane=16, scope="sys")
+        ttgl.amd.cdna5.cooperative_atomic_store(output + words, packet, bytes_per_lane=16, scope="sys")
+
+    source = gluon.GluonASTSource(kernel, {"inbox": "*i32", "output": "*i32", "epoch": "i32"}, {})
+    compiled = triton.compile(source, target=HIP_TARGET_CDNA5, options={"num_warps": 1})
+    llir = compiled.asm["llir"]
+    assert re.search(r"call <4 x i32> @llvm.amdgcn.cooperative.atomic.load.8x16B.p1", llir)
+    assert "@llvm.amdgcn.cooperative.atomic.store.8x16B.p1" in llir
+    assembly = compiled.asm["amdgcn"]
+    lines = assembly.splitlines()
+    labels = {match[1]: index for index, line in enumerate(lines) if (match := re.match(r"^(\.LBB\w+):", line))}
+    cycles = []
+    for index, line in enumerate(lines):
+        match = re.search(r"\bs_(?:cbranch_\w+|branch)\s+(\.LBB\w+)", line)
+        if match and labels[match[1]] < index:
+            cycles.append("\n".join(lines[labels[match[1]]:index + 1]))
+    assert any("global_load_b128" in cycle and "s_wait_loadcnt" in cycle for cycle in cycles)
+    assert "global_store_b128" in assembly
+
+
 ALL_TARGETS = [AMPERE_TARGET, HOPPER_TARGET, BLACKWELL_TARGET, HIP_TARGET_RDNA4]
 ALL_MULTICTA_TARGETS = [HOPPER_TARGET, BLACKWELL_TARGET, HIP_TARGET_CDNA5]
 

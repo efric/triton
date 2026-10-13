@@ -20,6 +20,8 @@ AMD CDNA 5
 
     buffer_load
     buffer_store
+    cooperative_atomic_load
+    cooperative_atomic_store
     get_scaled_upcast_fp4_scale_layout
     get_wmma_scale_layout
     load_shared_fp4_repacked

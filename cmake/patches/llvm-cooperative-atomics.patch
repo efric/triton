@@ -1,0 +1,348 @@
+AMDGPU: backport vector memory types for cooperative atomics
+
+Base: triton-lang/llvm-project 6bc4aaf6641c56ee104f6200c96a6a571bc77052
+
+The memory-type fix and regression cases come from upstream LLVM commit
+f8f362d165edce925b40468b84f2f68e7aa11f82 (#229501), by Gheorghe-Teodor
+Bercea. The original change assigns each cooperative atomic's value type to
+its memory type instead of using i64/i128 for vector values.
+
+This pin also needs the corresponding vector selection patterns. The
+v2i32/v4i32 global and flat patterns adapt the relevant part of upstream
+3eb867f9b63ae2881bbe3c25d3c12842f2bdc55e (#229688), by Matt Arsenault,
+without importing its wider all-type/all-address-space pattern refactor.
+
+Golden checks for the upstream regressions have been regenerated with this
+pin's llc to account for its register allocation and instruction scheduling.
+
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUInstructions.td b/llvm/lib/Target/AMDGPU/AMDGPUInstructions.td
+index d0607a2961a9..162d95670715 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUInstructions.td
++++ b/llvm/lib/Target/AMDGPU/AMDGPUInstructions.td
+@@ -541,6 +541,13 @@ def atomic_load_nonext_128_#as : PatFrag<(ops node:$ptr), (atomic_load_nonext_12
+   let IsAtomic = 1;
+ }
+
++foreach vt = [v2i32, v4i32] in {
++def atomic_load_nonext_#vt#_#as : PatFrag<(ops node:$ptr), (atomic_load_nonext node:$ptr)> {
++  let IsAtomic = 1;
++  let MemoryVT = vt;
++}
++}
++
+ def atomic_load_zext_8_#as : PatFrag<(ops node:$ptr), (atomic_load_zext_8 node:$ptr)> {
+   let IsAtomic = 1;
+ }
+@@ -607,6 +614,12 @@ def atomic_store_64_#as : PatFrag<(ops node:$val, node:$ptr),
+                                   (atomic_store_64 node:$val, node:$ptr)>;
+ def atomic_store_128_#as : PatFrag<(ops node:$val, node:$ptr),
+                                    (atomic_store_128 node:$val, node:$ptr)>;
++foreach vt = [v2i32, v4i32] in {
++def atomic_store_#vt#_#as : PatFrag<(ops node:$val, node:$ptr),
++                                   (atomic_store node:$val, node:$ptr)> {
++  let MemoryVT = vt;
++}
++}
+ } // End let IsAtomic = 1, AddressSpaces = ...
+ } // End foreach as
+
+diff --git a/llvm/lib/Target/AMDGPU/FLATInstructions.td b/llvm/lib/Target/AMDGPU/FLATInstructions.td
+index f241f6677d22..70009f3eea8e 100644
+--- a/llvm/lib/Target/AMDGPU/FLATInstructions.td
++++ b/llvm/lib/Target/AMDGPU/FLATInstructions.td
+@@ -2113,6 +2113,8 @@ defm : FlatLoadPats <FLAT_LOAD_DWORDX2, atomic_load_nonext_64_flat, i64>;
+ defm : FlatLoadPats <FLAT_LOAD_DWORDX2, atomic_load_nonext_64_flat, v4i16>;
+ defm : FlatLoadPats <FLAT_LOAD_DWORDX2, atomic_load_nonext_64_flat, v2i32>;
+ defm : FlatLoadPats <FLAT_LOAD_DWORDX4, atomic_load_nonext_128_flat, v4i32>;
++defm : FlatLoadPats <FLAT_LOAD_DWORDX2, atomic_load_nonext_v2i32_flat, v2i32>;
++defm : FlatLoadPats <FLAT_LOAD_DWORDX4, atomic_load_nonext_v4i32_flat, v4i32>;
+
+ defm : FlatStorePats <FLAT_STORE_BYTE, truncstorei8_flat, i32>;
+ defm : FlatStorePats <FLAT_STORE_SHORT, truncstorei16_flat, i32>;
+@@ -2140,6 +2142,8 @@ defm : FlatStorePats <FLAT_STORE_DWORDX2, atomic_store_64_flat, i64>;
+ defm : FlatStorePats <FLAT_STORE_DWORDX2, atomic_store_64_flat, v2i32>;
+ defm : FlatStorePats <FLAT_STORE_DWORDX2, atomic_store_64_flat, v4i16>;
+ defm : FlatStorePats <FLAT_STORE_DWORDX4, atomic_store_128_flat, v4i32>;
++defm : FlatStorePats <FLAT_STORE_DWORDX2, atomic_store_v2i32_flat, v2i32>;
++defm : FlatStorePats <FLAT_STORE_DWORDX4, atomic_store_v4i32_flat, v4i32>;
+ defm : FlatStorePats <FLAT_STORE_BYTE, atomic_store_8_flat, i32>;
+ defm : FlatStorePats <FLAT_STORE_SHORT, atomic_store_16_flat, i32>;
+
+@@ -2297,6 +2301,8 @@ defm : GlobalFLATLoadPats <GLOBAL_LOAD_DWORDX2, atomic_load_nonext_64_global, i6
+ defm : GlobalFLATLoadPats <GLOBAL_LOAD_DWORDX2, atomic_load_nonext_64_global, v2i32>;
+ defm : GlobalFLATLoadPats <GLOBAL_LOAD_DWORDX2, atomic_load_nonext_64_global, v4i16>;
+ defm : GlobalFLATLoadPats <GLOBAL_LOAD_DWORDX4, atomic_load_nonext_128_global, v4i32>;
++defm : GlobalFLATLoadPats <GLOBAL_LOAD_DWORDX2, atomic_load_nonext_v2i32_global, v2i32>;
++defm : GlobalFLATLoadPats <GLOBAL_LOAD_DWORDX4, atomic_load_nonext_v4i32_global, v4i32>;
+
+ defm : GlobalFLATStorePats <GLOBAL_STORE_BYTE, truncstorei8_global, i32>;
+ defm : GlobalFLATStorePats <GLOBAL_STORE_SHORT, truncstorei16_global, i32>;
+@@ -2346,6 +2352,8 @@ defm : GlobalFLATStorePats <GLOBAL_STORE_DWORDX2, atomic_store_64_global, i64>;
+ defm : GlobalFLATStorePats <GLOBAL_STORE_DWORDX2, atomic_store_64_global, v4i16>;
+ defm : GlobalFLATStorePats <GLOBAL_STORE_DWORDX2, atomic_store_64_global, v2i32>;
+ defm : GlobalFLATStorePats <GLOBAL_STORE_DWORDX4, atomic_store_128_global, v4i32>;
++defm : GlobalFLATStorePats <GLOBAL_STORE_DWORDX2, atomic_store_v2i32_global, v2i32>;
++defm : GlobalFLATStorePats <GLOBAL_STORE_DWORDX4, atomic_store_v4i32_global, v4i32>;
+
+ defm : GlobalFLATAtomicPats <"GLOBAL_ATOMIC_ADD", "atomic_load_add_global", i32>;
+ defm : GlobalFLATAtomicPats <"GLOBAL_ATOMIC_SUB", "atomic_load_sub_global", i32>;
+diff --git a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+index a55208053099..d2791b6aa98d 100644
+--- a/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
++++ b/llvm/lib/Target/AMDGPU/SIISelLowering.cpp
+@@ -1723,7 +1723,7 @@ void SITargetLowering::getTgtMemIntrinsic(SmallVectorImpl<IntrinsicInfo> &Infos,
+   case Intrinsic::amdgcn_cooperative_atomic_load_16x8B:
+   case Intrinsic::amdgcn_cooperative_atomic_load_8x16B: {
+     Info.opc = ISD::INTRINSIC_W_CHAIN;
+-    Info.memVT = EVT::getIntegerVT(CI.getContext(), getIntrMemWidth(IntrID));
++    Info.memVT = MVT::getVT(CI.getType());
+     Info.ptrVal = CI.getOperand(0);
+     Info.align.reset();
+     Info.flags = (MachineMemOperand::MOLoad | MOCooperative);
+@@ -1736,7 +1736,7 @@ void SITargetLowering::getTgtMemIntrinsic(SmallVectorImpl<IntrinsicInfo> &Infos,
+   case Intrinsic::amdgcn_cooperative_atomic_store_16x8B:
+   case Intrinsic::amdgcn_cooperative_atomic_store_8x16B: {
+     Info.opc = ISD::INTRINSIC_VOID;
+-    Info.memVT = EVT::getIntegerVT(CI.getContext(), getIntrMemWidth(IntrID));
++    Info.memVT = MVT::getVT(CI.getArgOperand(1)->getType());
+     Info.ptrVal = CI.getArgOperand(0);
+     Info.align.reset();
+     Info.flags = (MachineMemOperand::MOStore | MOCooperative);
+diff --git a/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.cooperative.atomic-basic.ll b/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.cooperative.atomic-basic.ll
+index 353e96a5dab5..c6ca699be859 100644
+--- a/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.cooperative.atomic-basic.ll
++++ b/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.cooperative.atomic-basic.ll
+@@ -48,12 +48,229 @@ entry:
+   ret void
+ }
+
++define void @test_store_16x8B_global(ptr addrspace(1) noundef %addr, <2 x i32> noundef %val)  {
++; GCN-LABEL: test_store_16x8B_global:
++; GCN:       ; %bb.0: ; %entry
++; GCN-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GCN-NEXT:    s_wait_kmcnt 0x0
++; GCN-NEXT:    global_store_b64 v[0:1], v[2:3], off scope:SCOPE_SYS
++; GCN-NEXT:    s_set_pc_i64 s[30:31]
++entry:
++  tail call void @llvm.amdgcn.cooperative.atomic.store.16x8B.p1(ptr addrspace(1) %addr, <2 x i32> %val, i32 0, metadata !0)
++  ret void
++}
++
++define void @test_store_8x16B_global(ptr addrspace(1) noundef %addr, <4 x i32> noundef %val)  {
++; GCN-LABEL: test_store_8x16B_global:
++; GCN:       ; %bb.0: ; %entry
++; GCN-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GCN-NEXT:    s_wait_kmcnt 0x0
++; GCN-NEXT:    global_store_b128 v[0:1], v[2:5], off scope:SCOPE_SYS
++; GCN-NEXT:    s_set_pc_i64 s[30:31]
++entry:
++  tail call void @llvm.amdgcn.cooperative.atomic.store.8x16B.p1(ptr addrspace(1) %addr, <4 x i32> %val, i32 0, metadata !0)
++  ret void
++}
++
++define i32 @test_load_16x8B_extract_and(ptr addrspace(1) noundef readonly %addr)  {
++; GCN-LABEL: test_load_16x8B_extract_and:
++; GCN:       ; %bb.0: ; %entry
++; GCN-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GCN-NEXT:    s_wait_kmcnt 0x0
++; GCN-NEXT:    global_load_b64 v[0:1], v[0:1], off scope:SCOPE_SYS
++; GCN-NEXT:    s_wait_loadcnt 0x0
++; GCN-NEXT:    s_wait_xcnt 0x0
++; GCN-NEXT:    v_and_b32_e32 v0, 0xff, v0
++; GCN-NEXT:    s_set_pc_i64 s[30:31]
++entry:
++  %0 = tail call <2 x i32> @llvm.amdgcn.cooperative.atomic.load.16x8B.p1(ptr addrspace(1) %addr, i32 0, metadata !0)
++  %elt = extractelement <2 x i32> %0, i32 0
++  %and = and i32 %elt, 255
++  ret i32 %and
++}
++
++define i32 @test_load_8x16B_extract_and(ptr addrspace(1) noundef readonly %addr)  {
++; GCN-LABEL: test_load_8x16B_extract_and:
++; GCN:       ; %bb.0: ; %entry
++; GCN-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GCN-NEXT:    s_wait_kmcnt 0x0
++; GCN-NEXT:    global_load_b128 v[0:3], v[0:1], off scope:SCOPE_SYS
++; GCN-NEXT:    s_wait_loadcnt 0x0
++; GCN-NEXT:    s_wait_xcnt 0x0
++; GCN-NEXT:    v_and_b32_e32 v0, 0xff, v0
++; GCN-NEXT:    s_set_pc_i64 s[30:31]
++entry:
++  %0 = tail call <4 x i32> @llvm.amdgcn.cooperative.atomic.load.8x16B.p1(ptr addrspace(1) %addr, i32 0, metadata !0)
++  %elt = extractelement <4 x i32> %0, i32 0
++  %and = and i32 %elt, 255
++  ret i32 %and
++}
++
++define half @test_load_8x16B_bitcast_v8f16(ptr addrspace(1) noundef readonly %addr)  {
++; GFX1250-SDAG-LABEL: test_load_8x16B_bitcast_v8f16:
++; GFX1250-SDAG:       ; %bb.0: ; %entry
++; GFX1250-SDAG-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GFX1250-SDAG-NEXT:    s_wait_kmcnt 0x0
++; GFX1250-SDAG-NEXT:    global_load_b128 v[0:3], v[0:1], off scope:SCOPE_SYS
++; GFX1250-SDAG-NEXT:    s_wait_loadcnt 0x0
++; GFX1250-SDAG-NEXT:    v_lshrrev_b32_e32 v2, 16, v0
++; GFX1250-SDAG-NEXT:    s_wait_xcnt 0x0
++; GFX1250-SDAG-NEXT:    s_delay_alu instid0(VALU_DEP_1)
++; GFX1250-SDAG-NEXT:    v_add_f16_e32 v0.l, v0.l, v2.l
++; GFX1250-SDAG-NEXT:    s_set_pc_i64 s[30:31]
++;
++; GFX1251-SDAG-LABEL: test_load_8x16B_bitcast_v8f16:
++; GFX1251-SDAG:       ; %bb.0: ; %entry
++; GFX1251-SDAG-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GFX1251-SDAG-NEXT:    s_wait_kmcnt 0x0
++; GFX1251-SDAG-NEXT:    global_load_b128 v[0:3], v[0:1], off scope:SCOPE_SYS
++; GFX1251-SDAG-NEXT:    s_wait_loadcnt 0x0
++; GFX1251-SDAG-NEXT:    v_lshrrev_b32_e32 v2, 16, v0
++; GFX1251-SDAG-NEXT:    s_wait_xcnt 0x0
++; GFX1251-SDAG-NEXT:    s_delay_alu instid0(VALU_DEP_1)
++; GFX1251-SDAG-NEXT:    v_add_f16_e32 v0.l, v0.l, v2.l
++; GFX1251-SDAG-NEXT:    s_set_pc_i64 s[30:31]
++;
++; GFX1250-GISEL-LABEL: test_load_8x16B_bitcast_v8f16:
++; GFX1250-GISEL:       ; %bb.0: ; %entry
++; GFX1250-GISEL-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GFX1250-GISEL-NEXT:    s_wait_kmcnt 0x0
++; GFX1250-GISEL-NEXT:    global_load_b128 v[0:3], v[0:1], off scope:SCOPE_SYS
++; GFX1250-GISEL-NEXT:    s_wait_loadcnt 0x0
++; GFX1250-GISEL-NEXT:    s_wait_xcnt 0x0
++; GFX1250-GISEL-NEXT:    v_add_f16_e32 v0.l, v0.l, v0.h
++; GFX1250-GISEL-NEXT:    s_set_pc_i64 s[30:31]
++;
++; GFX1251-GISEL-LABEL: test_load_8x16B_bitcast_v8f16:
++; GFX1251-GISEL:       ; %bb.0: ; %entry
++; GFX1251-GISEL-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GFX1251-GISEL-NEXT:    s_wait_kmcnt 0x0
++; GFX1251-GISEL-NEXT:    global_load_b128 v[0:3], v[0:1], off scope:SCOPE_SYS
++; GFX1251-GISEL-NEXT:    s_wait_loadcnt 0x0
++; GFX1251-GISEL-NEXT:    s_wait_xcnt 0x0
++; GFX1251-GISEL-NEXT:    v_add_f16_e32 v0.l, v0.l, v0.h
++; GFX1251-GISEL-NEXT:    s_set_pc_i64 s[30:31]
++entry:
++  %0 = tail call <4 x i32> @llvm.amdgcn.cooperative.atomic.load.8x16B.p1(ptr addrspace(1) %addr, i32 0, metadata !0)
++  %cast = bitcast <4 x i32> %0 to <8 x half>
++  %lo = extractelement <8 x half> %cast, i32 0
++  %hi = extractelement <8 x half> %cast, i32 1
++  %add = fadd half %lo, %hi
++  ret half %add
++}
++
++define i32 @test_load_8x16B_sext_inreg(ptr addrspace(1) noundef readonly %addr)  {
++; GCN-LABEL: test_load_8x16B_sext_inreg:
++; GCN:       ; %bb.0: ; %entry
++; GCN-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GCN-NEXT:    s_wait_kmcnt 0x0
++; GCN-NEXT:    global_load_b128 v[0:3], v[0:1], off scope:SCOPE_SYS
++; GCN-NEXT:    s_wait_loadcnt 0x0
++; GCN-NEXT:    s_wait_xcnt 0x0
++; GCN-NEXT:    v_bfe_i32 v0, v3, 0, 16
++; GCN-NEXT:    s_set_pc_i64 s[30:31]
++entry:
++  %0 = tail call <4 x i32> @llvm.amdgcn.cooperative.atomic.load.8x16B.p1(ptr addrspace(1) %addr, i32 0, metadata !0)
++  %elt = extractelement <4 x i32> %0, i32 3
++  %shl = shl i32 %elt, 16
++  %ashr = ashr i32 %shl, 16
++  ret i32 %ashr
++}
++
++define void @test_load_8x16B_live_out(ptr addrspace(1) noundef readonly %addr, ptr addrspace(1) noundef %out, i1 %cond)  {
++; GFX1250-SDAG-LABEL: test_load_8x16B_live_out:
++; GFX1250-SDAG:       ; %bb.0: ; %entry
++; GFX1250-SDAG-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GFX1250-SDAG-NEXT:    s_wait_kmcnt 0x0
++; GFX1250-SDAG-NEXT:    global_load_b128 v[6:9], v[0:1], off scope:SCOPE_SYS
++; GFX1250-SDAG-NEXT:    v_and_b32_e32 v4, 1, v4
++; GFX1250-SDAG-NEXT:    s_mov_b32 s0, exec_lo
++; GFX1250-SDAG-NEXT:    s_wait_xcnt 0x0
++; GFX1250-SDAG-NEXT:    s_delay_alu instid0(VALU_DEP_1)
++; GFX1250-SDAG-NEXT:    v_cmpx_eq_u32_e32 1, v4
++; GFX1250-SDAG-NEXT:    s_cbranch_execz .LBB9_2
++; GFX1250-SDAG-NEXT:  ; %bb.1: ; %use
++; GFX1250-SDAG-NEXT:    s_wait_loadcnt 0x0
++; GFX1250-SDAG-NEXT:    global_store_b128 v[2:3], v[6:9], off
++; GFX1250-SDAG-NEXT:  .LBB9_2: ; %exit
++; GFX1250-SDAG-NEXT:    s_wait_xcnt 0x0
++; GFX1250-SDAG-NEXT:    s_or_b32 exec_lo, exec_lo, s0
++; GFX1250-SDAG-NEXT:    s_wait_loadcnt 0x0
++; GFX1250-SDAG-NEXT:    s_set_pc_i64 s[30:31]
++;
++; GFX1251-SDAG-LABEL: test_load_8x16B_live_out:
++; GFX1251-SDAG:       ; %bb.0: ; %entry
++; GFX1251-SDAG-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GFX1251-SDAG-NEXT:    s_wait_kmcnt 0x0
++; GFX1251-SDAG-NEXT:    global_load_b128 v[6:9], v[0:1], off scope:SCOPE_SYS
++; GFX1251-SDAG-NEXT:    v_and_b32_e32 v4, 1, v4
++; GFX1251-SDAG-NEXT:    s_mov_b32 s0, exec_lo
++; GFX1251-SDAG-NEXT:    s_wait_xcnt 0x0
++; GFX1251-SDAG-NEXT:    s_delay_alu instid0(VALU_DEP_1)
++; GFX1251-SDAG-NEXT:    v_cmpx_eq_u32_e32 1, v4
++; GFX1251-SDAG-NEXT:    s_cbranch_execz .LBB9_2
++; GFX1251-SDAG-NEXT:  ; %bb.1: ; %use
++; GFX1251-SDAG-NEXT:    s_wait_loadcnt 0x0
++; GFX1251-SDAG-NEXT:    global_store_b128 v[2:3], v[6:9], off
++; GFX1251-SDAG-NEXT:  .LBB9_2: ; %exit
++; GFX1251-SDAG-NEXT:    s_wait_xcnt 0x0
++; GFX1251-SDAG-NEXT:    s_or_b32 exec_lo, exec_lo, s0
++; GFX1251-SDAG-NEXT:    s_wait_loadcnt 0x0
++; GFX1251-SDAG-NEXT:    s_set_pc_i64 s[30:31]
++;
++; GFX1250-GISEL-LABEL: test_load_8x16B_live_out:
++; GFX1250-GISEL:       ; %bb.0: ; %entry
++; GFX1250-GISEL-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GFX1250-GISEL-NEXT:    s_wait_kmcnt 0x0
++; GFX1250-GISEL-NEXT:    global_load_b128 v[6:9], v[0:1], off scope:SCOPE_SYS
++; GFX1250-GISEL-NEXT:    v_and_b32_e32 v4, 1, v4
++; GFX1250-GISEL-NEXT:    s_mov_b32 s0, exec_lo
++; GFX1250-GISEL-NEXT:    s_wait_xcnt 0x0
++; GFX1250-GISEL-NEXT:    s_delay_alu instid0(VALU_DEP_1)
++; GFX1250-GISEL-NEXT:    v_cmpx_ne_u32_e32 0, v4
++; GFX1250-GISEL-NEXT:    s_cbranch_execz .LBB9_2
++; GFX1250-GISEL-NEXT:  ; %bb.1: ; %use
++; GFX1250-GISEL-NEXT:    s_wait_loadcnt 0x0
++; GFX1250-GISEL-NEXT:    global_store_b128 v[2:3], v[6:9], off
++; GFX1250-GISEL-NEXT:  .LBB9_2: ; %exit
++; GFX1250-GISEL-NEXT:    s_wait_xcnt 0x0
++; GFX1250-GISEL-NEXT:    s_or_b32 exec_lo, exec_lo, s0
++; GFX1250-GISEL-NEXT:    s_wait_loadcnt 0x0
++; GFX1250-GISEL-NEXT:    s_set_pc_i64 s[30:31]
++;
++; GFX1251-GISEL-LABEL: test_load_8x16B_live_out:
++; GFX1251-GISEL:       ; %bb.0: ; %entry
++; GFX1251-GISEL-NEXT:    s_wait_loadcnt_dscnt 0x0
++; GFX1251-GISEL-NEXT:    s_wait_kmcnt 0x0
++; GFX1251-GISEL-NEXT:    global_load_b128 v[6:9], v[0:1], off scope:SCOPE_SYS
++; GFX1251-GISEL-NEXT:    v_and_b32_e32 v4, 1, v4
++; GFX1251-GISEL-NEXT:    s_mov_b32 s0, exec_lo
++; GFX1251-GISEL-NEXT:    s_wait_xcnt 0x0
++; GFX1251-GISEL-NEXT:    s_delay_alu instid0(VALU_DEP_1)
++; GFX1251-GISEL-NEXT:    v_cmpx_ne_u32_e32 0, v4
++; GFX1251-GISEL-NEXT:    s_cbranch_execz .LBB9_2
++; GFX1251-GISEL-NEXT:  ; %bb.1: ; %use
++; GFX1251-GISEL-NEXT:    s_wait_loadcnt 0x0
++; GFX1251-GISEL-NEXT:    global_store_b128 v[2:3], v[6:9], off
++; GFX1251-GISEL-NEXT:  .LBB9_2: ; %exit
++; GFX1251-GISEL-NEXT:    s_wait_xcnt 0x0
++; GFX1251-GISEL-NEXT:    s_or_b32 exec_lo, exec_lo, s0
++; GFX1251-GISEL-NEXT:    s_wait_loadcnt 0x0
++; GFX1251-GISEL-NEXT:    s_set_pc_i64 s[30:31]
++entry:
++  %0 = tail call <4 x i32> @llvm.amdgcn.cooperative.atomic.load.8x16B.p1(ptr addrspace(1) %addr, i32 0, metadata !0)
++  br i1 %cond, label %use, label %exit
++
++use:
++  store <4 x i32> %0, ptr addrspace(1) %out
++  br label %exit
++
++exit:
++  ret void
++}
++
+ !0 = !{ !"" }
+
+ ;; NOTE: These prefixes are unused and the list is autogenerated. Do not add tests below this line:
+ ; GFX1250: {{.*}}
+-; GFX1250-GISEL: {{.*}}
+-; GFX1250-SDAG: {{.*}}
+ ; GFX1251: {{.*}}
+-; GFX1251-GISEL: {{.*}}
+-; GFX1251-SDAG: {{.*}}

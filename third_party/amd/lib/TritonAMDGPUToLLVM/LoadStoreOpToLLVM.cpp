@@ -32,6 +32,94 @@ using triton::amdgpu::ISAFamily;
 
 namespace {
 
+template <typename OpTy>
+struct CooperativeAtomicOpConversion final : ConvertOpToLLVMPattern<OpTy> {
+  CooperativeAtomicOpConversion(LLVMTypeConverter &typeConverter,
+                                const AMD::TargetInfo &targetInfo,
+                                PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<OpTy>(typeConverter, benefit),
+        targetInfo(targetInfo) {}
+
+  LogicalResult
+  matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!triton::amdgpu::TargetFeatures(targetInfo.getArch())
+             .supportsCooperativeAtomics())
+      return rewriter.notifyMatchFailure(op,
+                                         "cooperative atomics require GFX12.5");
+
+    constexpr bool isLoad =
+        std::is_same_v<OpTy, triton::amdgpu::CooperativeAtomicLoadOp>;
+    auto pointerType = op.getPtr().getType();
+    Type elementType = this->getTypeConverter()->convertType(
+        getElementTypeOrSelf(triton::getPointeeType(pointerType)));
+    unsigned bytesPerLane = op.getBytesPerLane();
+    unsigned elementsPerLane =
+        bytesPerLane * 8 / elementType.getIntOrFloatBitWidth();
+    Type intrinsicType = rewriter.getI32Type();
+    if (bytesPerLane != 4)
+      intrinsicType = LLVM::getVectorType(intrinsicType, bytesPerLane / 4);
+    Type packedType = elementsPerLane == 1
+                          ? elementType
+                          : LLVM::getVectorType(elementType, elementsPerLane);
+    std::string intrinsic = std::string("llvm.amdgcn.cooperative.atomic.") +
+                            (isLoad ? "load." : "store.") +
+                            std::to_string(128 / bytesPerLane) + "x" +
+                            std::to_string(bytesPerLane) + "B";
+
+    insertAtomicOrderingBarriers(op, op.getSem(), true, rewriter, targetInfo);
+    Location loc = op.getLoc();
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto ptrs =
+        unpackTensorElements(loc, adaptor.getPtr(), rewriter, pointerType);
+    SmallVector<Value> values;
+    if constexpr (!isLoad)
+      values = unpackTensorElements(loc, adaptor.getValue(), rewriter,
+                                    op.getValue().getType());
+    auto scopeString =
+        LLVM::MDStringAttr::get(rewriter.getContext(), op.getScopeAttr());
+    auto scopeNode =
+        LLVM::MDNodeAttr::get(rewriter.getContext(), {scopeString});
+    Value scope = LLVM::MetadataAsValueOp::create(rewriter, loc, scopeNode);
+    Value ordering = b.i32_val(op.getOrdering());
+    SmallVector<Value> results;
+
+    // The verifier fixes the physical grouping. Do not use ordinary load/store
+    // vectorization or redundant-lane elimination for cooperative accesses.
+    for (unsigned start = 0; start < ptrs.size(); start += elementsPerLane) {
+      if constexpr (isLoad) {
+        Value loaded = LLVM::createLLVMIntrinsicCallOp(
+                           rewriter, loc, intrinsic, intrinsicType,
+                           {ptrs[start], ordering, scope})
+                           .getResult(0);
+        Value packed = b.bitcast(loaded, packedType);
+        llvm::append_range(results, unpackLLVector(loc, packed, rewriter));
+      } else {
+        Value packed = elementsPerLane == 1
+                           ? values[start]
+                           : packLLVector(loc,
+                                          ArrayRef<Value>(values).slice(
+                                              start, elementsPerLane),
+                                          rewriter);
+        Value raw = b.bitcast(packed, intrinsicType);
+        LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsic, {},
+                                        {ptrs[start], raw, ordering, scope});
+      }
+    }
+    if constexpr (isLoad) {
+      rewriter.replaceOp(op,
+                         packTensorElements(loc, this->getTypeConverter(),
+                                            results, rewriter, op.getType()));
+    } else {
+      rewriter.eraseOp(op);
+    }
+    return success();
+  }
+
+private:
+  const AMD::TargetInfo &targetInfo;
+};
+
 Value emitCtaMulticastMaskIfSupported(RewriterBase &rewriter, Location loc,
                                       const AMD::TargetInfo &targetInfo,
                                       const LinearLayout &layout,
@@ -2588,6 +2676,10 @@ void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                        RewritePatternSet &patterns,
                                        ModuleAxisInfoAnalysis &axisInfoAnalysis,
                                        PatternBenefit benefit) {
+  patterns.add<
+      CooperativeAtomicOpConversion<triton::amdgpu::CooperativeAtomicLoadOp>,
+      CooperativeAtomicOpConversion<triton::amdgpu::CooperativeAtomicStoreOp>>(
+      typeConverter, targetInfo, benefit);
   patterns.add<AtomicCASOpConversion, AtomicRMWOpConversion, LoadOpConversion,
                StoreOpConversion, BufferLoadOpConversion,
                BufferLoadToLocalOpConversion, BufferStoreOpConversion,
