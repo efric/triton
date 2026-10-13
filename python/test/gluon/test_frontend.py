@@ -137,6 +137,70 @@ def test_cooperative_atomic_load_polling():
     assert "global_store_b128" in assembly
 
 
+@pytest.mark.parametrize("bytes_per_lane", [4, 8, 16])
+def test_cooperative_atomic_loaded_packet_mask(bytes_per_lane):
+    import triton
+
+    @gluon.jit
+    def kernel(src, dst, observed, flags, BYTES: ttgl.constexpr):
+        layout: ttgl.constexpr = ttgl.BlockedLayout([1, BYTES // 2], [BYTES // 4, 128 // BYTES], [1, 1], [1, 0])
+        packet = ttgl.arange(0, 4, layout=ttgl.SliceLayout(1, layout))
+        word = ttgl.arange(0, 64, layout=ttgl.SliceLayout(0, layout))
+        offsets = packet[:, None] * 64 + word[None, :]
+        active = ttgl.load(flags + packet) != 0
+        value = ttgl.amd.cdna5.cooperative_atomic_load(src + offsets, active[:, None], other=offsets,
+                                                       bytes_per_lane=BYTES, scope="sys")
+        ttgl.amd.cdna5.cooperative_atomic_store(dst + offsets, value, active[:, None], bytes_per_lane=BYTES,
+                                                scope="sys")
+        ttgl.store(observed + offsets, value)
+
+    source = gluon.GluonASTSource(kernel, {"src": "*bf16", "dst": "*bf16", "observed": "*bf16", "flags": "*i32"},
+                                  {"BYTES": bytes_per_lane})
+    compiled = triton.compile(source, target=HIP_TARGET_CDNA5, options={"num_warps": 1})
+    llir = compiled.asm["llir"]
+    suffix = f"{128 // bytes_per_lane}x{bytes_per_lane}B.p1"
+    for operation in ("load", "store"):
+        assert len(re.findall(rf"call .*@llvm.amdgcn.cooperative.atomic.{operation}.{suffix}",
+                              llir)) == 16 // bytes_per_lane
+    assert "br i1" in llir and "phi" in llir
+    assembly = compiled.asm["amdgcn"]
+    if bytes_per_lane > 4:
+        assert "s_and_saveexec_b32" in assembly
+        assert "s_cbranch_execz" in assembly
+    assert re.search(rf"global_load_b{bytes_per_lane * 8} .*scope:SCOPE_SYS", assembly)
+    assert re.search(rf"global_store_b{bytes_per_lane * 8} .*scope:SCOPE_SYS", assembly)
+
+
+@pytest.mark.parametrize("split_registers", [False, True])
+def test_cooperative_atomic_mask_splits_packet(split_registers, capfd):
+    import triton
+
+    @gluon.jit
+    def kernel(src, dst, SPLIT_REGISTERS: ttgl.constexpr):
+        if SPLIT_REGISTERS:
+            layout: ttgl.constexpr = ttgl.BlockedLayout([1, 4], [4, 8], [1, 1], [1, 0])
+            rows = ttgl.arange(0, 4, layout=ttgl.SliceLayout(1, layout))
+            cols = ttgl.arange(0, 32, layout=ttgl.SliceLayout(0, layout))
+            mask = cols[None, :] < 31
+            offsets = rows[:, None] * 32 + cols[None, :]
+        else:
+            layout: ttgl.constexpr = ttgl.BlockedLayout([1, 4], [16, 2], [1, 1], [1, 0])
+            rows = ttgl.arange(0, 16, layout=ttgl.SliceLayout(1, layout))
+            cols = ttgl.arange(0, 8, layout=ttgl.SliceLayout(0, layout))
+            # A packet spans four rows even though each row's mask is uniform.
+            mask = rows[:, None] < 1
+            offsets = rows[:, None] * 8 + cols[None, :]
+        value = ttgl.amd.cdna5.cooperative_atomic_load(src + offsets, mask, other=0, bytes_per_lane=16)
+        ttgl.store(dst + offsets, value)
+
+    source = gluon.GluonASTSource(kernel, {"src": "*i32", "dst": "*i32"}, {
+        "SPLIT_REGISTERS": split_registers,
+    })
+    with pytest.raises(RuntimeError):
+        triton.compile(source, target=HIP_TARGET_CDNA5, options={"num_warps": 1})
+    assert "mask must be provably constant across each complete 128-byte region" in capfd.readouterr().err
+
+
 ALL_TARGETS = [AMPERE_TARGET, HOPPER_TARGET, BLACKWELL_TARGET, HIP_TARGET_RDNA4]
 ALL_MULTICTA_TARGETS = [HOPPER_TARGET, BLACKWELL_TARGET, HIP_TARGET_CDNA5]
 

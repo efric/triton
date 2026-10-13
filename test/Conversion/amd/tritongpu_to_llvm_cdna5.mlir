@@ -86,6 +86,39 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 
 // -----
 
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [16, 2], warpsPerCTA = [1, 1], order = [1, 0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: llvm.func @cooperative_atomic_mask_across_axes
+  tt.func @cooperative_atomic_mask_across_axes(
+      %src: tensor<16x8x!tt.ptr<i32>, #blocked>,
+      %dst: tensor<16x8x!tt.ptr<i32>, #blocked>,
+      %active: i32,
+      %other: tensor<16x8xi32, #blocked>) {
+    %four = arith.constant dense<4> : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %rows = tt.make_range {start = 0 : i32, end = 16 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %packet = arith.divsi %rows, %four : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %limit = tt.splat %active : i32 -> tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %enabled = arith.cmpi slt, %packet, %limit : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked}>>
+    %expanded = tt.expand_dims %enabled {axis = 1 : i32} : tensor<16xi1, #ttg.slice<{dim = 1, parent = #blocked}>> -> tensor<16x1xi1, #blocked>
+    %mask = tt.broadcast %expanded : tensor<16x1xi1, #blocked> -> tensor<16x8xi1, #blocked>
+    // The mask is constant over a packet spanning four logical rows.
+    // GFX1250: llvm.cond_br {{.*}}, ^[[LOAD:bb[0-9]+]], ^[[MERGE:bb[0-9]+]]({{.*}} : vector<4xi32>)
+    // GFX1250: ^[[LOAD]]:
+    // GFX1250: %[[VALUE:.*]] = llvm.call_intrinsic "llvm.amdgcn.cooperative.atomic.load.8x16B"
+    // GFX1250: llvm.br ^[[MERGE]](%[[VALUE]] : vector<4xi32>)
+    // GFX1250: ^[[MERGE]](%{{.*}}: vector<4xi32>):
+    %value = amdg.cooperative_atomic_load %src, %mask, %other {bytesPerLane = 16 : i32, ordering = 0 : i32, scope = ""} : tensor<16x8x!tt.ptr<i32>, #blocked> -> tensor<16x8xi32, #blocked>
+    // GFX1250: llvm.cond_br {{.*}}, ^[[STORE:bb[0-9]+]], ^[[END:bb[0-9]+]]
+    // GFX1250: ^[[STORE]]:
+    // GFX1250: llvm.call_intrinsic "llvm.amdgcn.cooperative.atomic.store.8x16B"
+    // GFX1250: llvm.br ^[[END]]
+    amdg.cooperative_atomic_store %dst, %value, %mask {bytesPerLane = 16 : i32, ordering = 0 : i32, scope = ""} : tensor<16x8x!tt.ptr<i32>, #blocked>, tensor<16x8xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
 #linear = #ttg.linear<{register = [[0, 1], [0, 2], [0, 8], [0, 16]], lane = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 4]], warp = [[16, 0]], block = []}>
 #mma = #ttg.amd_wmma<{version = 3, ctaLayout = {warp = [[1, 0]]}, isTranspose = true, instrShape = [16, 16, 32]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 32 : i32} {

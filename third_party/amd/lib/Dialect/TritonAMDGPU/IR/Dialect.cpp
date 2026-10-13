@@ -1271,6 +1271,8 @@ static LogicalResult verifyCooperativeAtomic(Operation *op,
 }
 
 LogicalResult CooperativeAtomicLoadOp::verify() {
+  if (getOther() && !getMask())
+    return emitOpError("other requires a mask");
   return verifyCooperativeAtomic(getOperation(), getPtr().getType(),
                                  getBytesPerLane(), getOrdering(), getScope(),
                                  false);

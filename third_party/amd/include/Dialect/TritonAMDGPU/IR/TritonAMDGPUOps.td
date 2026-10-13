@@ -262,16 +262,23 @@ def CondBarrierOp : TT_AMDGPU_Op<"cond_barrier"> {
 
 def CooperativeAtomicLoadOp : TT_AMDGPU_Op<"cooperative_atomic_load", [
   AtomicOpInterface,
+  AttrSizedOperandSegments,
   SameLoadStoreOperandsAndResultEncoding,
-  TypesMatchWith<"result matches ptr type", "ptr", "result", "getPointeeType($_self)">
+  TypesMatchWith<"result matches ptr type", "ptr", "result", "getPointeeType($_self)">,
+  TypesMatchWith<"result and mask have the same shape", "result", "mask", "getI1SameShape($_self)",
+                 "(cast<CooperativeAtomicLoadOp>($_op).getMask() == nullptr) || std::equal_to<>()">,
+  TypesMatchWith<"result and other have the same type", "result", "other", "$_self",
+                 "(cast<CooperativeAtomicLoadOp>($_op).getOther() == nullptr) || std::equal_to<>()">
 ]> {
   let summary = "Cooperatively load naturally aligned 128-byte global regions";
   let description = [{
     Each naturally aligned group of 32, 16, or 8 lanes in a wave32 accesses
     4, 8, or 16 bytes per lane, respectively, as a single 128-byte atomic region.
     The pointer layout must assign consecutive elements to each lane's fixed
-    access and complete regions to consecutive participating lanes. All lanes
-    participate. Pointers must designate contiguous, naturally aligned global
+    access and complete regions to consecutive participating lanes. The optional
+    mask must be provably constant over every complete region. Inactive regions
+    perform no access and return `other`, or undefined values if it is absent.
+    Active pointers must designate contiguous, naturally aligned global
     storage on a fabric supporting cooperative atomic accesses.
 
     `ordering` uses the C ABI memory-order encoding: 0 (relaxed), 2 (acquire),
@@ -281,12 +288,14 @@ def CooperativeAtomicLoadOp : TT_AMDGPU_Op<"cooperative_atomic_load", [
   }];
   let arguments = (ins
     Arg<TT_PtrTensor, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$ptr,
+    Optional<TT_BoolTensor>:$mask,
+    Optional<TT_FpIntTensor>:$other,
     I32Attr:$bytesPerLane,
     I32Attr:$ordering,
     StrAttr:$scope
   );
   let results = (outs TT_FpIntTensor:$result);
-  let assemblyFormat = "$ptr attr-dict `:` type($ptr) `->` type($result)";
+  let assemblyFormat = "$ptr (`,` $mask^)? (`,` $other^)? attr-dict `:` type($ptr) `->` type($result)";
   let extraClassDeclaration = [{ ::mlir::triton::MemSemantic getSem(); }];
   let hasVerifier = 1;
 }
@@ -294,7 +303,9 @@ def CooperativeAtomicLoadOp : TT_AMDGPU_Op<"cooperative_atomic_load", [
 def CooperativeAtomicStoreOp : TT_AMDGPU_Op<"cooperative_atomic_store", [
   AtomicOpInterface,
   SameLoadStoreOperandsEncoding,
-  TypesMatchWith<"value matches ptr type", "ptr", "value", "getPointeeType($_self)">
+  TypesMatchWith<"value matches ptr type", "ptr", "value", "getPointeeType($_self)">,
+  TypesMatchWith<"value and mask have the same shape", "value", "mask", "getI1SameShape($_self)",
+                 "(cast<CooperativeAtomicStoreOp>($_op).getMask() == nullptr) || std::equal_to<>()">
 ]> {
   let summary = "Cooperatively store naturally aligned 128-byte global regions";
   let description = [{
@@ -305,11 +316,12 @@ def CooperativeAtomicStoreOp : TT_AMDGPU_Op<"cooperative_atomic_store", [
   let arguments = (ins
     Arg<TT_PtrTensor, "", [MemWrite<GlobalMemory>]>:$ptr,
     TT_FpIntTensor:$value,
+    Optional<TT_BoolTensor>:$mask,
     I32Attr:$bytesPerLane,
     I32Attr:$ordering,
     StrAttr:$scope
   );
-  let assemblyFormat = "$ptr `,` $value attr-dict `:` type($ptr) `,` type($value)";
+  let assemblyFormat = "$ptr `,` $value (`,` $mask^)? attr-dict `:` type($ptr) `,` type($value)";
   let extraClassDeclaration = [{ ::mlir::triton::MemSemantic getSem(); }];
   let hasVerifier = 1;
 }

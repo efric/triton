@@ -32,13 +32,44 @@ using triton::amdgpu::ISAFamily;
 
 namespace {
 
+static bool isCooperativeMaskUniform(Value mask, unsigned elementsPerLane,
+                                     unsigned lanesPerPacket,
+                                     ModuleAxisInfoAnalysis &axisAnalysis) {
+  auto *axisInfo = axisAnalysis.getAxisInfo(mask);
+  auto type = cast<RankedTensorType>(mask.getType());
+  if (!axisInfo || axisInfo->getRank() != type.getRank())
+    return false;
+  ArrayRef<int64_t> constancy = axisInfo->getConstancy();
+  if (llvm::any_of(constancy, [](int64_t size) {
+        return size <= 0 || !llvm::isPowerOf2_64(size);
+      }))
+    return false;
+
+  LinearLayout layout = toLinearLayout(type);
+  auto kRegister = StringAttr::get(mask.getContext(), "register");
+  auto kLane = StringAttr::get(mask.getContext(), "lane");
+  // Every packet basis must stay inside one aligned constant rectangle. This
+  // covers packets that span multiple logical axes, not just the minor axis.
+  for (auto [dim, size] : {std::pair{kRegister, elementsPerLane},
+                           std::pair{kLane, lanesPerPacket}}) {
+    for (unsigned bit = 0; bit < llvm::Log2_32(size); ++bit) {
+      for (auto [basis, constant] :
+           llvm::zip(layout.getBasis(dim, bit), constancy))
+        if (basis >= constant)
+          return false;
+    }
+  }
+  return true;
+}
+
 template <typename OpTy>
 struct CooperativeAtomicOpConversion final : ConvertOpToLLVMPattern<OpTy> {
   CooperativeAtomicOpConversion(LLVMTypeConverter &typeConverter,
                                 const AMD::TargetInfo &targetInfo,
+                                ModuleAxisInfoAnalysis &axisAnalysis,
                                 PatternBenefit benefit)
       : ConvertOpToLLVMPattern<OpTy>(typeConverter, benefit),
-        targetInfo(targetInfo) {}
+        targetInfo(targetInfo), axisAnalysis(axisAnalysis) {}
 
   LogicalResult
   matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
@@ -56,6 +87,11 @@ struct CooperativeAtomicOpConversion final : ConvertOpToLLVMPattern<OpTy> {
     unsigned bytesPerLane = op.getBytesPerLane();
     unsigned elementsPerLane =
         bytesPerLane * 8 / elementType.getIntOrFloatBitWidth();
+    if (Value mask = op.getMask();
+        mask && !isCooperativeMaskUniform(mask, elementsPerLane,
+                                          128 / bytesPerLane, axisAnalysis))
+      return op.emitOpError("mask must be provably constant across each "
+                            "complete 128-byte region");
     Type intrinsicType = rewriter.getI32Type();
     if (bytesPerLane != 4)
       intrinsicType = LLVM::getVectorType(intrinsicType, bytesPerLane / 4);
@@ -72,10 +108,18 @@ struct CooperativeAtomicOpConversion final : ConvertOpToLLVMPattern<OpTy> {
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto ptrs =
         unpackTensorElements(loc, adaptor.getPtr(), rewriter, pointerType);
-    SmallVector<Value> values;
-    if constexpr (!isLoad)
+    SmallVector<Value> masks, values, others;
+    if (op.getMask())
+      masks = unpackTensorElements(loc, adaptor.getMask(), rewriter,
+                                   op.getMask().getType());
+    if constexpr (isLoad) {
+      if (op.getOther())
+        others = unpackTensorElements(loc, adaptor.getOther(), rewriter,
+                                      op.getOther().getType());
+    } else {
       values = unpackTensorElements(loc, adaptor.getValue(), rewriter,
                                     op.getValue().getType());
+    }
     auto scopeString =
         LLVM::MDStringAttr::get(rewriter.getContext(), op.getScopeAttr());
     auto scopeNode =
@@ -87,11 +131,25 @@ struct CooperativeAtomicOpConversion final : ConvertOpToLLVMPattern<OpTy> {
     // The verifier fixes the physical grouping. Do not use ordinary load/store
     // vectorization or redundant-lane elimination for cooperative accesses.
     for (unsigned start = 0; start < ptrs.size(); start += elementsPerLane) {
+      Value pred = masks.empty() ? Value() : masks[start];
       if constexpr (isLoad) {
-        Value loaded = LLVM::createLLVMIntrinsicCallOp(
-                           rewriter, loc, intrinsic, intrinsicType,
-                           {ptrs[start], ordering, scope})
-                           .getResult(0);
+        Value other = b.undef(intrinsicType);
+        if (!others.empty()) {
+          Value packed = elementsPerLane == 1
+                             ? others[start]
+                             : packLLVector(loc,
+                                            ArrayRef<Value>(others).slice(
+                                                start, elementsPerLane),
+                                            rewriter);
+          other = b.bitcast(packed, intrinsicType);
+        }
+        Value loaded = emitPredicated(rewriter, loc, pred, {other}, [&] {
+          Value value = LLVM::createLLVMIntrinsicCallOp(
+                            rewriter, loc, intrinsic, intrinsicType,
+                            {ptrs[start], ordering, scope})
+                            .getResult(0);
+          return SmallVector<Value>{value};
+        })[0];
         Value packed = b.bitcast(loaded, packedType);
         llvm::append_range(results, unpackLLVector(loc, packed, rewriter));
       } else {
@@ -102,8 +160,11 @@ struct CooperativeAtomicOpConversion final : ConvertOpToLLVMPattern<OpTy> {
                                               start, elementsPerLane),
                                           rewriter);
         Value raw = b.bitcast(packed, intrinsicType);
-        LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsic, {},
-                                        {ptrs[start], raw, ordering, scope});
+        emitPredicated(rewriter, loc, pred, {}, [&] {
+          LLVM::createLLVMIntrinsicCallOp(rewriter, loc, intrinsic, {},
+                                          {ptrs[start], raw, ordering, scope});
+          return SmallVector<Value>{};
+        });
       }
     }
     if constexpr (isLoad) {
@@ -118,6 +179,7 @@ struct CooperativeAtomicOpConversion final : ConvertOpToLLVMPattern<OpTy> {
 
 private:
   const AMD::TargetInfo &targetInfo;
+  ModuleAxisInfoAnalysis &axisAnalysis;
 };
 
 Value emitCtaMulticastMaskIfSupported(RewriterBase &rewriter, Location loc,
@@ -2679,7 +2741,7 @@ void populateLoadStoreOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
   patterns.add<
       CooperativeAtomicOpConversion<triton::amdgpu::CooperativeAtomicLoadOp>,
       CooperativeAtomicOpConversion<triton::amdgpu::CooperativeAtomicStoreOp>>(
-      typeConverter, targetInfo, benefit);
+      typeConverter, targetInfo, axisInfoAnalysis, benefit);
   patterns.add<AtomicCASOpConversion, AtomicRMWOpConversion, LoadOpConversion,
                StoreOpConversion, BufferLoadOpConversion,
                BufferLoadToLocalOpConversion, BufferStoreOpConversion,

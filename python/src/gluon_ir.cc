@@ -1217,18 +1217,18 @@ void init_gluon_ir(py::module_ &m) {
                                                        partitionNumWarps);
            })
       .def("create_cooperative_atomic_load",
-           [](GluonOpBuilder &self, Type resultType, Value ptr,
-              int32_t bytesPerLane, int32_t ordering,
+           [](GluonOpBuilder &self, Type resultType, Value ptr, Value mask,
+              Value other, int32_t bytesPerLane, int32_t ordering,
               const std::string &scope) -> Value {
              return self.create<ttag::CooperativeAtomicLoadOp>(
-                 resultType, ptr, bytesPerLane, ordering, scope);
+                 resultType, ptr, mask, other, bytesPerLane, ordering, scope);
            })
       .def("create_cooperative_atomic_store",
-           [](GluonOpBuilder &self, Value ptr, Value value,
+           [](GluonOpBuilder &self, Value ptr, Value value, Value mask,
               int32_t bytesPerLane, int32_t ordering,
               const std::string &scope) {
              self.create<ttag::CooperativeAtomicStoreOp>(
-                 ptr, value, bytesPerLane, ordering, scope);
+                 ptr, value, mask, bytesPerLane, ordering, scope);
            })
       .def("create_buffer_load",
            [](GluonOpBuilder &self, Type resultType, Value ptr, Value offsets,

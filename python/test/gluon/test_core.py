@@ -23,6 +23,7 @@ from triton._internal_testing import (
     is_hip_cdna,
     is_hip_cdna3,
     is_hip_cdna4,
+    is_hip_gfx1250,
     is_hopper_or_newer,
     is_hopper,
     skip_if_unsupported_cluster_size,
@@ -55,6 +56,41 @@ from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 from triton._C.libtriton.gluon_ir import make_cga_layout
 
 THREADS_PER_WARP = triton.runtime.driver.active.get_current_target().warp_size
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires CDNA5 cooperative atomics")
+@pytest.mark.parametrize("bytes_per_lane", [4, 8, 16])
+def test_cooperative_atomic_packet_mask_values(bytes_per_lane, device):
+
+    @gluon.jit
+    def kernel(src, dst, observed, flags, BYTES: ttgl.constexpr):
+        layout: ttgl.constexpr = ttgl.BlockedLayout([1, BYTES // 4], [BYTES // 4, 128 // BYTES], [1, 1], [1, 0])
+        packet = ttgl.arange(0, 4, layout=ttgl.SliceLayout(1, layout))
+        word = ttgl.arange(0, 32, layout=ttgl.SliceLayout(0, layout))
+        offsets = packet[:, None] * 32 + word[None, :]
+        active = ttgl.load(flags + packet) != 0
+        value = ttgl.amd.cdna5.cooperative_atomic_load(src + offsets, active[:, None], other=-offsets - 1,
+                                                       bytes_per_lane=BYTES)
+        ttgl.amd.cdna5.cooperative_atomic_store(dst + offsets, value, active[:, None], bytes_per_lane=BYTES)
+        ttgl.store(observed + offsets, value)
+
+    # The fourth logical packet has no backing allocation. The second exists
+    # but must retain its previous contents when disabled.
+    src = torch.arange(96, dtype=torch.int32, device=device)
+    dst = torch.full_like(src, -7)
+    observed = torch.empty((4, 32), dtype=torch.int32, device=device)
+    flags = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device=device)
+    kernel[(1, )](src, dst, observed, flags, bytes_per_lane, num_warps=1)
+    offsets = torch.arange(128, dtype=torch.int32, device=device).reshape(4, 32)
+    expected = torch.where(flags[:, None].bool(), offsets, -offsets - 1)
+    torch.testing.assert_close(observed, expected, atol=0, rtol=0)
+    expected_dst = torch.where(flags[:3, None].bool(), src.reshape(3, 32), -7)
+    torch.testing.assert_close(dst.reshape(3, 32), expected_dst, atol=0, rtol=0)
+
+    flags.zero_()
+    kernel[(1, )](src, dst, observed, flags, bytes_per_lane, num_warps=1)
+    torch.testing.assert_close(observed, -offsets - 1, atol=0, rtol=0)
+    torch.testing.assert_close(dst.reshape(3, 32), expected_dst, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("elementwise", [False, True])

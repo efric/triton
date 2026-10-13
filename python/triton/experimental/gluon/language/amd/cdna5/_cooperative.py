@@ -1,3 +1,5 @@
+from triton._C.libtriton import ir
+
 from ..._core import builtin, distributed_type, tensor, _unwrap_if_constexpr
 from ..._layouts import DistributedLayout
 from ..._semantic import _check
@@ -40,15 +42,23 @@ def _cooperative_atomic_args(pointer, bytes_per_lane, sem, scope, is_store):
 
 
 @builtin
-def cooperative_atomic_load(pointer, *, bytes_per_lane, sem="relaxed", scope="gpu", _semantic=None):
+def cooperative_atomic_load(pointer, mask=None, other=None, *, bytes_per_lane, sem="relaxed", scope="gpu",
+                            _semantic=None):
     """Load naturally aligned 128-byte regions cooperatively on CDNA5.
 
     ``pointer`` is a tensor of global-memory pointers with an explicit layout.
     Each lane loads ``bytes_per_lane`` contiguous bytes per instruction, using
     groups of 32, 16, or 8 consecutive lanes for 4, 8, or 16 bytes respectively.
-    Each group must address a contiguous, 128-byte-aligned region. All lanes
-    participate, and every accessed byte must be backed by storage. These
-    address and allocation requirements are caller preconditions.
+    Each active group must address a contiguous, 128-byte-aligned region, and
+    every accessed byte must be backed by storage. These address and allocation
+    requirements are caller preconditions.
+
+    ``mask`` is broadcast to the pointer shape and must be provably constant
+    across every 128-byte group, including all elements held by each lane.
+    Broadcasting a per-packet predicate across the packet's elements expresses
+    this directly. An inactive group performs no memory access and returns
+    ``other``, or undefined values if ``other`` is omitted. A partial payload
+    still requires a complete active packet; arbitrary element masks are invalid.
 
     Each 128-byte region is loaded atomically with respect to matching
     cooperative stores. Different regions can be observed independently. The
@@ -60,6 +70,9 @@ def cooperative_atomic_load(pointer, *, bytes_per_lane, sem="relaxed", scope="gp
 
     Args:
         pointer (tensor): Tensor of pointers to 8-, 16-, 32-, or 64-bit numbers.
+        mask (tensor or scalar, optional): Boolean predicate for whole packets.
+        other (tensor or scalar, optional): Values for inactive packets, broadcast
+            and converted to the pointer's element type. Requires ``mask``.
         bytes_per_lane (constexpr): Fixed access size per lane: 4, 8, or 16.
         sem (constexpr): ``"relaxed"``, ``"acquire"``, or ``"seq_cst"``.
         scope (constexpr): ``"gpu"``, ``"cta"``, or ``"sys"``, or an AMD LLVM
@@ -71,14 +84,25 @@ def cooperative_atomic_load(pointer, *, bytes_per_lane, sem="relaxed", scope="gp
     """
     pointer = _semantic.to_tensor(pointer)
     bytes_per_lane, ordering, scope = _cooperative_atomic_args(pointer, bytes_per_lane, sem, scope, False)
+    mask = _unwrap_if_constexpr(mask)
+    other = _unwrap_if_constexpr(other)
+    _check(mask is not None or other is None, lambda: "other requires a mask")
+    if mask is not None:
+        mask = _semantic.to_tensor(mask)
+        pointer, mask = _semantic.broadcast_impl_value(pointer, mask)
+    if other is not None:
+        other = _semantic.cast(_semantic.to_tensor(other), pointer.dtype.element_ty)
+        pointer, other = _semantic.broadcast_impl_value(pointer, other)
     result_ty = pointer.type.with_element_ty(pointer.dtype.element_ty)
     handle = _semantic.builder.create_cooperative_atomic_load(result_ty.to_ir(_semantic.builder), pointer.handle,
+                                                              mask.handle if mask is not None else ir.value(),
+                                                              other.handle if other is not None else ir.value(),
                                                               bytes_per_lane, ordering, scope)
     return tensor(handle, result_ty)
 
 
 @builtin
-def cooperative_atomic_store(pointer, value, *, bytes_per_lane, sem="relaxed", scope="gpu", _semantic=None):
+def cooperative_atomic_store(pointer, value, mask=None, *, bytes_per_lane, sem="relaxed", scope="gpu", _semantic=None):
     """Store naturally aligned 128-byte regions cooperatively on CDNA5.
 
     The layout, participation, address, and target requirements are the same as
@@ -89,6 +113,8 @@ def cooperative_atomic_store(pointer, value, *, bytes_per_lane, sem="relaxed", s
     Args:
         pointer (tensor): Tensor of global-memory pointers.
         value (tensor or scalar): Values to store.
+        mask (tensor or scalar, optional): Boolean predicate for whole packets;
+            inactive packets perform no memory access.
         bytes_per_lane (constexpr): Fixed access size per lane: 4, 8, or 16.
         sem (constexpr): ``"relaxed"``, ``"release"``, or ``"seq_cst"``.
         scope (constexpr): Synchronization scope; see :func:`cooperative_atomic_load`.
@@ -97,6 +123,9 @@ def cooperative_atomic_store(pointer, value, *, bytes_per_lane, sem="relaxed", s
     bytes_per_lane, ordering, scope = _cooperative_atomic_args(pointer, bytes_per_lane, sem, scope, True)
     _check(not pointer.dtype.is_const(), lambda: "cannot store through a constant pointer")
     value = _semantic.to_tensor(value)
-    pointer, value, _ = _semantic._broadcast_ptr_val_mask(pointer, value, None)
+    mask = _unwrap_if_constexpr(mask)
+    pointer, value, mask = _semantic._broadcast_ptr_val_mask(pointer, value, mask)
     value = _semantic.cast(value, pointer.dtype.element_ty)
-    _semantic.builder.create_cooperative_atomic_store(pointer.handle, value.handle, bytes_per_lane, ordering, scope)
+    _semantic.builder.create_cooperative_atomic_store(pointer.handle, value.handle,
+                                                      mask.handle if mask is not None else ir.value(), bytes_per_lane,
+                                                      ordering, scope)
