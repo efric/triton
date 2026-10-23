@@ -1,5 +1,29 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+#blocked = #ttg.blocked<{sizePerThread = [8], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @cooperative_atomic_interleaved_chunks(%ptr: !tt.ptr<i32>, %offsets: tensor<256xi32, #blocked>) {
+    // Each lane owns 32 contiguous bytes, so its neighbor does not continue
+    // its 16-byte access.
+    // expected-error @below {{layout must map consecutive lanes of 4, 8 or 16 contiguous bytes to each 128-byte region}}
+    %value = amdg.cooperative_atomic_load relaxed, sys, %ptr[%offsets] : !tt.ptr<i32> -> tensor<256xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-warps" = 1 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @cooperative_atomic_acquire_store(%ptr: !tt.ptr<i32>, %offsets: tensor<128xi32, #blocked>, %value: tensor<128xi32, #blocked>) {
+    // expected-error @below {{only supports release and relaxed semantics}}
+    amdg.cooperative_atomic_store acquire, sys, %value, %ptr[%offsets] : !tt.ptr<i32> -> tensor<128xi32, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
 // expected-error @+1 {{WMMA version must be in the [1, 3] range}}
 #wmma = #ttg.amd_wmma<{version = 0, isTranspose = false, ctaLayout = {warp = [[0, 1], [1, 0]]}}>
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {

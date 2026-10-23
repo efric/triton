@@ -10,6 +10,7 @@ AMD CDNA 5
 
     async_copy
     cluster
+    cooperative
     mbarrier
     tdm
 
